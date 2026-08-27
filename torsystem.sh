@@ -399,6 +399,79 @@ cmd_check() {
     fi
 }
 
+# ---------- TUI (interactive menu) ----------
+# Runs a cmd_* function in a subshell so an internal 'exit' (e.g. from die())
+# only ends that subshell, not the whole TUI session; output is captured to
+# a temp file and shown in a scrollable box.
+_tui_run_and_show() {
+    local backend="$1" title="$2"; shift 2
+    local tmp
+    tmp="$(mktemp)"
+
+    ( "$@" ) > "$tmp" 2>&1
+    local status=$?
+
+    sed -ri 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$tmp" 2>/dev/null || true
+    "$backend" --title "$title" --textbox "$tmp" 25 90
+    rm -f "$tmp"
+    return $status
+}
+
+_tui_confirm() {
+    local backend="$1" msg="$2"
+    "$backend" --title "Confirm" --yesno "$msg" 10 60
+}
+
+cmd_tui() {
+    local backend=""
+    if command -v whiptail >/dev/null 2>&1; then
+        backend="whiptail"
+    elif command -v dialog >/dev/null 2>&1; then
+        backend="dialog"
+    else
+        die "Neither 'whiptail' nor 'dialog' is installed.
+  Debian/Ubuntu: sudo apt install whiptail
+  Arch:          sudo pacman -S dialog
+  Fedora:        sudo dnf install dialog"
+    fi
+
+    require_root
+
+    while true; do
+        local choice exitstatus
+        choice=$("$backend" --title "torsystem — Tor Network Control" \
+            --menu "Choose an action:" 20 72 8 \
+            "1" "Install prerequisites"                 \
+            "2" "Start routing through Tor"              \
+            "3" "Stop routing (restore normal network)"   \
+            "4" "Restart / get new Tor identity"            \
+            "5" "Show status"                                \
+            "6" "Run leak check"                              \
+            "7" "Exit" \
+            3>&1 1>&2 2>&3)
+        exitstatus=$?
+
+        if [[ $exitstatus -ne 0 ]]; then
+            break
+        fi
+
+        case "$choice" in
+            1) _tui_run_and_show "$backend" "Installing prerequisites..." cmd_install ;;
+            2) _tui_run_and_show "$backend" "Starting Tor routing..." cmd_start ;;
+            3)
+                if _tui_confirm "$backend" "Stop Tor routing and restore normal networking?"; then
+                    _tui_run_and_show "$backend" "Stopping..." cmd_stop
+                fi
+                ;;
+            4) _tui_run_and_show "$backend" "Getting new Tor identity..." cmd_restart ;;
+            5) _tui_run_and_show "$backend" "Status" cmd_status ;;
+            6) _tui_run_and_show "$backend" "Leak check" cmd_check ;;
+            7) break ;;
+        esac
+    done
+    clear
+}
+
 # ---------- Usage ----------
 usage() {
     print_banner
@@ -412,6 +485,7 @@ usage() {
     ${C_CYAN}restart${C_RESET}     Request a new Tor identity
     ${C_CYAN}status${C_RESET}      Show current status and exit IP
     ${C_CYAN}check${C_RESET}       Verify traffic is really passing through Tor
+    ${C_CYAN}tui${C_RESET}         Launch an interactive menu (whiptail/dialog)
 
 EOF
 }
@@ -426,6 +500,7 @@ main() {
         restart)  cmd_restart ;;
         status)   cmd_status ;;
         check)    cmd_check ;;
+        tui)      cmd_tui ;;
         *)        usage; exit 1 ;;
     esac
 }
