@@ -33,6 +33,7 @@
 - 🐧 **Multi-distro** — auto-detects `pacman`, `apt`, or `dnf`
 - ↩️ **Fully reversible** — `stop` restores your previous `iptables` rules exactly as they were
 - 🎨 **Nice terminal UI** — ASCII banner, colors, spinners, and progress bars
+- 🖥️ **Optional menu-driven TUI** — `torsystem.sh tui` gives you a `whiptail`-based point-and-click menu, no flags to remember
 
 ## 📦 Requirements
 
@@ -72,7 +73,25 @@ sudo ./torsystem.sh stop      # restore normal networking
 | `stop`    | Restore normal networking                                   |
 | `restart` | Request a new Tor identity (new exit IP)                    |
 | `status`  | Show current status and exit IP                             |
+| `tui`     | Launch an interactive menu (whiptail/dialog)                 |
 | `check`   | Verify traffic is really passing through Tor                |
+
+## 🖥️ Interactive TUI (optional)
+
+Prefer menus over remembering flags? Run the built-in terminal UI instead — no extra files, it's the same script:
+
+```bash
+sudo ./torsystem.sh tui
+```
+
+This launches a `whiptail`/`dialog`-based menu (works over SSH too, no GUI needed) with the same actions — Install, Start, Stop, Restart, Status, Check — presented as a simple list you navigate with arrow keys.
+
+> Requires `whiptail` (preinstalled on most Debian/Ubuntu systems) or `dialog` (Arch/Fedora):
+> ```bash
+> sudo apt install whiptail     # Debian/Ubuntu
+> sudo pacman -S dialog         # Arch
+> sudo dnf install dialog       # Fedora
+> ```
 
 ## ⚙️ How it works
 
