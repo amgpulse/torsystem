@@ -132,10 +132,13 @@ spinner_run() {
     wait "$pid"
     local status=$?
 
+    local cr=""
+    [[ -t 1 ]] && cr="\r"
+
     if [[ $status -eq 0 ]]; then
-        printf "\r  ${C_GREEN}✔${C_RESET} %s\n" "$msg"
+        printf "${cr}  ${C_GREEN}✔${C_RESET} %s\n" "$msg"
     else
-        printf "\r  ${C_RED}✘${C_RESET} %s\n" "$msg"
+        printf "${cr}  ${C_RED}✘${C_RESET} %s\n" "$msg"
         echo -e "${C_GRAY}"
         sed 's/^/      /' "$logfile"
         echo -e "${C_RESET}"
@@ -366,13 +369,57 @@ cmd_status() {
     fi
 
     if command -v curl >/dev/null 2>&1; then
-        local ip_info
-        if ip_info=$(curl -s --max-time 10 https://check.torproject.org/api/ip); then
+        local ip_info exit_ip
+        if ip_info=$(_tor_check_fetch); then
+            exit_ip=$(echo "$ip_info" | grep -oE '"IP":"[^"]+"' | cut -d'"' -f4)
+            if [[ -n "$exit_ip" ]]; then
+                echo -e "  Exit IP: ${C_BOLD}${exit_ip}${C_RESET}"
+            fi
             echo -e "  ${C_DIM}$ip_info${C_RESET}"
         else
-            err "Could not reach check.torproject.org."
+            _tor_check_diagnose "$?"
         fi
     fi
+}
+
+# _tor_check_fetch — try check.torproject.org, then a fallback endpoint.
+# Prints the JSON response on success; returns curl's exit code on failure.
+_tor_check_fetch() {
+    local resp curl_status
+    resp=$(curl -s --max-time 20 --retry 2 --retry-delay 2 \
+        https://check.torproject.org/api/ip 2>/dev/null)
+    curl_status=$?
+    if [[ $curl_status -eq 0 && -n "$resp" ]]; then
+        echo "$resp"
+        return 0
+    fi
+
+    # Fallback: check.torproject.org itself may be blocked/filtered by some
+    # ISPs/networks even when Tor routing works fine. Confirm at least that
+    # traffic is going out somewhere, and note the fallback was used.
+    local ip
+    ip=$(curl -s --max-time 20 --retry 2 --retry-delay 2 https://api.ipify.org 2>/dev/null)
+    if [[ -n "$ip" ]]; then
+        echo "{\"IsTor\":\"unknown (check.torproject.org unreachable, used fallback)\",\"IP\":\"$ip\"}"
+        return 0
+    fi
+
+    return "$curl_status"
+}
+
+# _tor_check_diagnose <curl-exit-code> — print a specific reason instead of
+# a generic "could not reach" message.
+_tor_check_diagnose() {
+    local code="$1"
+    case "$code" in
+        6)  err "DNS resolution failed. If Tor just restarted, wait a few seconds and try again — otherwise DNS routing (DNSPort) may not be active." ;;
+        7)  err "Connection refused. Is Tor actually running? Check: ${C_DIM}systemctl status tor${C_RESET}" ;;
+        28) err "Connection timed out. check.torproject.org may be blocked/filtered on your network, or the Tor circuit is slow/still building." ;;
+        35|60) err "TLS/certificate error while connecting." ;;
+        *)  err "Could not reach check.torproject.org (curl exit code: $code)." ;;
+    esac
+    warn "This can also happen if check.torproject.org is blocked on your network."
+    warn "Try again in a few seconds, or run: ${C_DIM}curl -v https://check.torproject.org/api/ip${C_RESET} manually to see more detail."
 }
 
 # ---------- Leak check ----------
@@ -380,15 +427,25 @@ cmd_check() {
     print_banner
     require_cmds curl
     log "Verifying traffic is routed through Tor..."
-    local resp
-    resp=$(curl -s --max-time 10 https://check.torproject.org/api/ip || echo "")
-    if [[ -z "$resp" ]]; then
-        err "No response received. Check your connection or configuration."
+    local resp curl_status
+    resp=$(_tor_check_fetch)
+    curl_status=$?
+    if [[ $curl_status -ne 0 || -z "$resp" ]]; then
+        _tor_check_diagnose "$curl_status"
+        echo ""
+        warn "Further diagnostics:"
+        echo -e "    ${C_DIM}journalctl -u tor -n 50${C_RESET}          (Tor bootstrap / errors)"
+        echo -e "    ${C_DIM}ss -tlnp | grep -E '9040|5353'${C_RESET}   (TransPort / DNSPort listening?)"
+        echo -e "    ${C_DIM}sudo iptables -t nat -L -n -v${C_RESET}    (rules actually applied?)"
         return 1
     fi
     echo -e "  ${C_DIM}$resp${C_RESET}"
     if echo "$resp" | grep -q '"IsTor":true'; then
         ok "${C_GREEN}${C_BOLD}Confirmed:${C_RESET} traffic is exiting through Tor."
+    elif echo "$resp" | grep -q '"IsTor":"unknown'; then
+        warn "check.torproject.org was unreachable, so Tor exit status could not be confirmed directly."
+        warn "A fallback IP lookup succeeded, meaning routing works, but this does NOT confirm it's via Tor."
+        echo -e "    ${C_DIM}journalctl -u tor -n 50${C_RESET}          (Tor bootstrap / errors)"
     else
         err "${C_RED}${C_BOLD}Warning:${C_RESET} traffic is NOT exiting through Tor — possible leak."
         echo ""
@@ -397,6 +454,37 @@ cmd_check() {
         echo -e "    ${C_DIM}ss -tlnp | grep -E '9040|5353'${C_RESET}   (TransPort / DNSPort listening?)"
         echo -e "    ${C_DIM}sudo iptables -t nat -L -n -v${C_RESET}    (rules actually applied?)"
     fi
+}
+
+
+# ---------- Exit node preference ----------
+# set_torrc_exit_node <CC|""> — set or clear a preferred exit country.
+# Passing an empty string clears the restriction (any exit node, default).
+set_torrc_exit_node() {
+    local code="${1:-}"
+    require_root
+    require_cmds tor
+
+    # Remove any exit-node lines we previously added.
+    sed -i '/^ExitNodes /d; /^StrictNodes /d' "$TORRC_PATH"
+
+    if [[ -n "$code" ]]; then
+        log "Setting preferred exit country to: ${C_BOLD}$code${C_RESET}"
+        cat >> "$TORRC_PATH" <<EOF
+ExitNodes {$code}
+StrictNodes 1
+EOF
+    else
+        log "Clearing exit node preference (any country)."
+    fi
+
+    spinner_run "Restarting Tor to apply the change" -- systemctl restart tor
+    wait_for_tor_bootstrap 60
+    wait_for_ports_listening
+    echo ""
+    ok "${C_BOLD}Exit node preference updated.${C_RESET}"
+    echo ""
+    cmd_status --no-banner
 }
 
 # ---------- TUI (interactive menu) ----------
@@ -411,7 +499,7 @@ _tui_run_and_show() {
     ( "$@" ) > "$tmp" 2>&1
     local status=$?
 
-    sed -ri 's/\x1B\[[0-9;]*[a-zA-Z]//g' "$tmp" 2>/dev/null || true
+    sed -ri 's/\x1B\[[0-9;]*[a-zA-Z]//g; s/\r//g' "$tmp" 2>/dev/null || true
     "$backend" --title "$title" --textbox "$tmp" 25 90
     rm -f "$tmp"
     return $status
@@ -440,14 +528,15 @@ cmd_tui() {
     while true; do
         local choice exitstatus
         choice=$("$backend" --title "torsystem — Tor Network Control" \
-            --menu "Choose an action:" 20 72 8 \
+            --menu "Choose an action:" 21 72 9 \
             "1" "Install prerequisites"                 \
             "2" "Start routing through Tor"              \
             "3" "Stop routing (restore normal network)"   \
             "4" "Restart / get new Tor identity"            \
             "5" "Show status"                                \
             "6" "Run leak check"                              \
-            "7" "Exit" \
+            "7" "Advanced settings"                            \
+            "8" "Exit" \
             3>&1 1>&2 2>&3)
         exitstatus=$?
 
@@ -466,10 +555,61 @@ cmd_tui() {
             4) _tui_run_and_show "$backend" "Getting new Tor identity..." cmd_restart ;;
             5) _tui_run_and_show "$backend" "Status" cmd_status ;;
             6) _tui_run_and_show "$backend" "Leak check" cmd_check ;;
-            7) break ;;
+            7) cmd_tui_advanced "$backend" ;;
+            8) break ;;
         esac
     done
     clear
+}
+
+# ---------- TUI: Advanced Settings submenu ----------
+cmd_tui_advanced() {
+    local backend="$1"
+    while true; do
+        local choice exitstatus
+        choice=$("$backend" --title "Advanced Settings" \
+            --menu "Preferred exit node country:" 22 68 11 \
+            "DE" "Germany"                     \
+            "NL" "Netherlands"                  \
+            "US" "United States"                 \
+            "GB" "United Kingdom"                 \
+            "FR" "France"                           \
+            "SE" "Sweden"                             \
+            "CH" "Switzerland"                         \
+            "CUSTOM" "Enter a custom country code..."   \
+            "ANY"    "Any country (clear preference)"    \
+            "BACK"   "Back to main menu" \
+            3>&1 1>&2 2>&3)
+        exitstatus=$?
+
+        if [[ $exitstatus -ne 0 ]] || [[ "$choice" == "BACK" ]]; then
+            break
+        fi
+
+        case "$choice" in
+            ANY)
+                _tui_run_and_show "$backend" "Clearing exit node preference..." set_torrc_exit_node ""
+                ;;
+            CUSTOM)
+                local code custom_status
+                code=$("$backend" --title "Custom Exit Node" \
+                    --inputbox "Enter a 2-letter country code (e.g. DE, NL, JP):" 10 60 \
+                    3>&1 1>&2 2>&3)
+                custom_status=$?
+                if [[ $custom_status -eq 0 && -n "$code" ]]; then
+                    code="$(echo "$code" | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z')"
+                    if [[ ${#code} -eq 2 ]]; then
+                        _tui_run_and_show "$backend" "Setting exit node to $code..." set_torrc_exit_node "$code"
+                    else
+                        "$backend" --title "Invalid input" --msgbox "Please enter exactly 2 letters (ISO country code), e.g. DE or JP." 9 60
+                    fi
+                fi
+                ;;
+            *)
+                _tui_run_and_show "$backend" "Setting exit node to $choice..." set_torrc_exit_node "$choice"
+                ;;
+        esac
+    done
 }
 
 # ---------- Usage ----------
