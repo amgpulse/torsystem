@@ -46,6 +46,7 @@ NON_TOR_NETS=("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "$VIRT
 TORRC_PATH="/etc/tor/torrc"
 TORRC_BACKUP="/etc/tor/torrc.torsystem.bak"
 IPTABLES_SAVE_PATH="/var/lib/torsystem/iptables.rules.bak"
+IP6TABLES_SAVE_PATH="/var/lib/torsystem/ip6tables.rules.bak"
 STATE_DIR="/var/lib/torsystem"
 STATE_FILE="$STATE_DIR/state"
 
@@ -272,6 +273,40 @@ EOF
 }
 
 # ---------- Start ----------
+# ---------- IPv6 leak protection ----------
+# Tor only routes IPv4 in this setup; if IPv6 is enabled on the system it
+# could bypass Tor entirely. Fail-safe approach: block ALL outbound IPv6
+# traffic while routing is active, rather than trying to route it (which
+# Tor doesn't support here). No IPv6 = no IPv6 leak.
+block_ipv6_leaks() {
+    if ! command -v ip6tables >/dev/null 2>&1; then
+        warn "ip6tables not found — cannot block IPv6. If this system has IPv6 enabled, it may bypass Tor."
+        return 0
+    fi
+
+    log "Blocking all IPv6 traffic (prevents IPv6 leaks — only IPv4 is routed through Tor)..."
+    ip6tables-save > "$IP6TABLES_SAVE_PATH" 2>/dev/null || true
+    ip6tables -F 2>/dev/null || true
+    ip6tables -t nat -F 2>/dev/null || true
+    ip6tables -P INPUT ACCEPT 2>/dev/null || true
+    ip6tables -P FORWARD ACCEPT 2>/dev/null || true
+    ip6tables -A OUTPUT -o lo -j ACCEPT
+    ip6tables -A OUTPUT -j DROP
+}
+
+restore_ipv6() {
+    if ! command -v ip6tables >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log "Restoring previous IPv6 rules..."
+    ip6tables -F 2>/dev/null || true
+    ip6tables -t nat -F 2>/dev/null || true
+    if [[ -f "$IP6TABLES_SAVE_PATH" ]]; then
+        ip6tables-restore < "$IP6TABLES_SAVE_PATH" 2>/dev/null || true
+    fi
+}
+
 cmd_start() {
     require_root
     require_cmds tor iptables curl
@@ -313,6 +348,8 @@ cmd_start() {
     iptables -A OUTPUT -p tcp --syn -j ACCEPT
     iptables -A OUTPUT -j DROP
 
+    block_ipv6_leaks
+
     echo "active" > "$STATE_FILE"
     echo ""
     ok "${C_BOLD}${C_GREEN}Tor routing is now ACTIVE.${C_RESET} All TCP + DNS traffic is anonymized."
@@ -331,6 +368,8 @@ cmd_stop() {
     if [[ -f "$IPTABLES_SAVE_PATH" ]]; then
         spinner_run "Restoring previous iptables rules" -- bash -c "iptables-restore < '$IPTABLES_SAVE_PATH'"
     fi
+
+    restore_ipv6
 
     echo "inactive" > "$STATE_FILE"
     echo ""

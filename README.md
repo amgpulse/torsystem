@@ -26,7 +26,7 @@
 ## ✨ Features
 
 - 🧅 **System-wide routing** — all TCP + DNS traffic transparently redirected through Tor via `iptables`
-- 🛡️ **Leak-proof by default** — a final `DROP` rule blocks anything that isn't routed through Tor instead of silently leaking it
+- 🛡️ **Leak-proof by default** — a final `DROP` rule blocks anything that isn't routed through Tor instead of silently leaking it, and all IPv6 traffic is blocked outright (Tor only carries IPv4 here)
 - ⏳ **Bootstrap-aware** — waits for Tor to actually finish bootstrapping (polls `journalctl`) before flipping traffic over, instead of a blind sleep
 - 🔄 **One-command identity rotation** — get a fresh exit IP with `restart`
 - 🔍 **Built-in leak check** — verifies against `check.torproject.org` that you're really exiting through Tor
@@ -34,6 +34,7 @@
 - ↩️ **Fully reversible** — `stop` restores your previous `iptables` rules exactly as they were
 - 🎨 **Nice terminal UI** — ASCII banner, colors, spinners, and progress bars
 - 🖥️ **Optional menu-driven TUI** — `torsystem.sh tui` gives you a `whiptail`-based point-and-click menu, no flags to remember
+- 🌍 **Exit node country selection** — pick a preferred exit country from a quick list or enter a custom code, right from the TUI's Advanced Settings
 
 ## 📦 Requirements
 
@@ -93,6 +94,16 @@ This launches a `whiptail`/`dialog`-based menu (works over SSH too, no GUI neede
 > sudo dnf install dialog       # Fedora
 > ```
 
+### Advanced Settings — exit node country
+
+From the TUI's main menu, choose **Advanced settings** to pick a preferred exit country:
+
+- Quick list: Germany, Netherlands, United States, United Kingdom, France, Sweden, Switzerland
+- **Custom code**: enter any 2-letter ISO country code (e.g. `JP`, `CA`)
+- **Any country**: clears the restriction and goes back to the default (any exit relay)
+
+Picking a country updates `torrc` (`ExitNodes {XX}` + `StrictNodes 1`), restarts Tor, and waits for it to re-bootstrap before returning you to the menu. Note: restricting to one country means fewer available relays, so circuits may take a little longer to build.
+
 ## ⚙️ How it works
 
 1. `torrc` is configured with a `TransPort` (TCP) and `DNSPort` (DNS).
@@ -104,17 +115,19 @@ This launches a `whiptail`/`dialog`-based menu (works over SSH too, no GUI neede
 
 ## ⚠️ Limitations
 
+- **`check.torproject.org` may be blocked** on some networks/ISPs (it's a known Tor-related domain). `status` and `check` now retry with a longer timeout and fall back to a plain IP lookup if it's unreachable — but that fallback can't confirm you're actually exiting through Tor, only that traffic is going out. If you're on such a network, treat a fallback result with caution and check `journalctl -u tor` for real bootstrap status.
+
 - **UDP** (other than DNS) isn't routed — Tor only carries TCP. UDP-only apps (some games, VoIP) will be **blocked**, not leaked.
-- **IPv6** isn't handled in this version — disable it system-wide if it's active, or extend the script.
+- **IPv6 is blocked outright** while routing is active, since Tor only carries IPv4 traffic here. This is intentional and fail-safe: rather than risk an IPv6 leak, any IPv6 traffic is dropped. If an app absolutely needs IPv6, it won't work while routing is on — that's by design.
 - Tor is great for browsing, not for torrenting/streaming/heavy downloads — it's slower than a regular VPN, and misusing it burdens the whole Tor network.
-- Backups live in `/var/lib/torsystem` (`iptables`) and `/etc/tor/torrc.torsystem.bak` (original `torrc`).
+- Backups live in `/var/lib/torsystem` (`iptables` + `ip6tables`) and `/etc/tor/torrc.torsystem.bak` (original `torrc`).
 
 ## 🧩 Roadmap / extending this
 
 All logic lives in isolated functions (`cmd_install`, `cmd_start`, `cmd_stop`, `cmd_restart`, `cmd_status`, `cmd_check`), so it's straightforward to:
 - Wrap it in a GUI (Python/PyQt, GTK, etc.) via `subprocess` + `pkexec`
-- Add IPv6 support
 - Add per-app exclusion rules
+- Add Tor bridge support for censored networks
 
 Contributions and PRs are welcome.
 
