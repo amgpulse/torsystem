@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# torsystem.sh — Transparently route all system traffic through the Tor network (VPN-like)
+# torsystem.sh — Route TCP and DNS traffic through the Tor network
 #
 # Usage:
 #   sudo ./torsystem.sh install     Install prerequisites and configure Tor
@@ -49,6 +49,10 @@ IPTABLES_SAVE_PATH="/var/lib/torsystem/iptables.rules.bak"
 IP6TABLES_SAVE_PATH="/var/lib/torsystem/ip6tables.rules.bak"
 STATE_DIR="/var/lib/torsystem"
 STATE_FILE="$STATE_DIR/state"
+BACKEND_FILE="$STATE_DIR/firewall-backend"
+IPTABLES_CHAIN="TORSYSTEM_OUT"
+NAT_CHAIN="TORSYSTEM_NAT"
+IP6TABLES_CHAIN="TORSYSTEM6_OUT"
 
 # ---------- Banner ----------
 print_banner() {
@@ -63,7 +67,7 @@ print_banner() {
                               __/ |
                              |___/
 EOF
-    echo -e "${C_RESET}${C_GRAY}         route all system traffic through Tor${C_RESET}"
+    echo -e "${C_RESET}${C_GRAY}         route TCP and DNS traffic through Tor${C_RESET}"
     echo ""
 }
 
@@ -93,7 +97,19 @@ ensure_state_dir() {
 }
 
 is_active() {
-    [[ -f "$STATE_FILE" ]] && [[ "$(cat "$STATE_FILE")" == "active" ]]
+    [[ -f "$STATE_FILE" ]] &&
+        [[ "$(cat "$STATE_FILE")" == "active" ]] || return 1
+    if [[ -f "$BACKEND_FILE" ]] && [[ "$(cat "$BACKEND_FILE")" == "chains" ]]; then
+        command -v iptables >/dev/null 2>&1 || return 1
+        iptables -C OUTPUT -j "$IPTABLES_CHAIN" >/dev/null 2>&1 || return 1
+        iptables -t nat -C OUTPUT -j "$NAT_CHAIN" >/dev/null 2>&1 || return 1
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -C OUTPUT -j "$IP6TABLES_CHAIN" >/dev/null 2>&1 || return 1
+        fi
+        return 0
+    else
+        return 0
+    fi
 }
 
 detect_pkg_manager() {
@@ -130,8 +146,12 @@ spinner_run() {
         done
     fi
 
-    wait "$pid"
-    local status=$?
+    local status=0
+    if wait "$pid"; then
+        status=0
+    else
+        status=$?
+    fi
 
     local cr=""
     [[ -t 1 ]] && cr="\r"
@@ -150,8 +170,7 @@ spinner_run() {
 
 # wait_for_tor_bootstrap [timeout_seconds]
 # Polls journalctl for "Bootstrapped 100%" instead of a fixed sleep.
-# Applying iptables rules before Tor finishes bootstrapping is the #1
-# cause of everything timing out right after 'start'.
+# Routing is not enabled unless Tor finishes bootstrapping.
 wait_for_tor_bootstrap() {
     local timeout="${1:-60}"
     local waited=0
@@ -160,7 +179,8 @@ wait_for_tor_bootstrap() {
     local pct=""
 
     while (( waited < timeout )); do
-        pct=$(journalctl -u tor --no-pager -n 40 2>/dev/null | grep -oP 'Bootstrapped \K[0-9]+(?=%)' | tail -1)
+        pct=$(journalctl -u tor --no-pager -n 40 2>/dev/null |
+            grep -oP 'Bootstrapped \K[0-9]+(?=%)' | tail -1 || true)
         if [[ "$pct" == "100" ]]; then
             if [[ -t 1 ]]; then printf "\r  ${C_GREEN}✔${C_RESET} Tor bootstrap complete (100%%)               \n"; fi
             return 0
@@ -175,7 +195,7 @@ wait_for_tor_bootstrap() {
     done
 
     echo ""
-    warn "Tor did not report 100% bootstrap within ${timeout}s — continuing, but this may cause timeouts."
+    warn "Tor did not report 100% bootstrap within ${timeout}s."
     warn "Check: ${C_DIM}journalctl -u tor -n 50${C_RESET}"
     return 1
 }
@@ -192,7 +212,7 @@ wait_for_ports_listening() {
         sleep 1
         retries=$((retries - 1))
     done
-    warn "TransPort (${TRANS_PORT}) or DNSPort (${DNS_PORT}) not detected as listening."
+    warn "TransPort (${TRANS_PORT}) or DNSPort (${DNS_PORT}) not detected as listening; routing cannot be enabled."
     warn "Routing may fail. Check: ${C_DIM}ss -tlnp | grep -E '${TRANS_PORT}|${DNS_PORT}'${C_RESET}"
     return 1
 }
@@ -245,7 +265,6 @@ cmd_install() {
     esac
 
     ensure_state_dir
-    echo "inactive" > "$STATE_FILE"
 
     if [[ ! -f "$TORRC_BACKUP" ]]; then
         cp "$TORRC_PATH" "$TORRC_BACKUP"
@@ -267,12 +286,13 @@ EOF
         log "torrc settings already present, skipping."
     fi
 
-    systemctl enable tor >/dev/null 2>&1 || true
+    if ! systemctl enable tor >/dev/null 2>&1; then
+        warn "Could not enable Tor at boot; you may need to enable the tor service manually."
+    fi
     echo ""
     ok "${C_BOLD}Installation complete.${C_RESET} Run '${C_CYAN}start${C_RESET}' to go live."
 }
 
-# ---------- Start ----------
 # ---------- IPv6 leak protection ----------
 # Tor only routes IPv4 in this setup; if IPv6 is enabled on the system it
 # could bypass Tor entirely. Fail-safe approach: block ALL outbound IPv6
@@ -284,14 +304,12 @@ block_ipv6_leaks() {
         return 0
     fi
 
-    log "Blocking all IPv6 traffic (prevents IPv6 leaks — only IPv4 is routed through Tor)..."
-    ip6tables-save > "$IP6TABLES_SAVE_PATH" 2>/dev/null || true
-    ip6tables -F 2>/dev/null || true
-    ip6tables -t nat -F 2>/dev/null || true
-    ip6tables -P INPUT ACCEPT 2>/dev/null || true
-    ip6tables -P FORWARD ACCEPT 2>/dev/null || true
-    ip6tables -A OUTPUT -o lo -j ACCEPT
-    ip6tables -A OUTPUT -j DROP
+    log "Blocking outbound IPv6 traffic (Tor routing here supports IPv4 only)..."
+    ip6tables -N "$IP6TABLES_CHAIN" || return 1
+    ip6tables -A "$IP6TABLES_CHAIN" -o lo -j ACCEPT || return 1
+    ip6tables -A "$IP6TABLES_CHAIN" -j DROP || return 1
+    ip6tables -C OUTPUT -j "$IP6TABLES_CHAIN" 2>/dev/null ||
+        ip6tables -I OUTPUT 1 -j "$IP6TABLES_CHAIN" || return 1
 }
 
 restore_ipv6() {
@@ -299,60 +317,111 @@ restore_ipv6() {
         return 0
     fi
 
-    log "Restoring previous IPv6 rules..."
-    ip6tables -F 2>/dev/null || true
-    ip6tables -t nat -F 2>/dev/null || true
-    if [[ -f "$IP6TABLES_SAVE_PATH" ]]; then
-        ip6tables-restore < "$IP6TABLES_SAVE_PATH" 2>/dev/null || true
+    while ip6tables -C OUTPUT -j "$IP6TABLES_CHAIN" >/dev/null 2>&1; do
+        ip6tables -D OUTPUT -j "$IP6TABLES_CHAIN" || return 1
+    done
+    if ip6tables -S "$IP6TABLES_CHAIN" >/dev/null 2>&1; then
+        ip6tables -F "$IP6TABLES_CHAIN" || return 1
+        ip6tables -X "$IP6TABLES_CHAIN" || return 1
     fi
 }
 
+apply_iptables_rules() {
+    iptables -t nat -N "$NAT_CHAIN" || return 1
+    iptables -N "$IPTABLES_CHAIN" || return 1
+
+    iptables -t nat -A "$NAT_CHAIN" -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
+    iptables -t nat -A "$NAT_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    iptables -t nat -A "$NAT_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    for net in "${NON_TOR_NETS[@]}"; do
+        iptables -t nat -A "$NAT_CHAIN" -d "$net" -j RETURN || return 1
+    done
+    iptables -t nat -A "$NAT_CHAIN" -p tcp --syn -j REDIRECT --to-ports "$TRANS_PORT" || return 1
+
+    iptables -A "$IPTABLES_CHAIN" -m state --state ESTABLISHED,RELATED -j ACCEPT || return 1
+    iptables -A "$IPTABLES_CHAIN" -o lo -j ACCEPT || return 1
+    for net in "${NON_TOR_NETS[@]}"; do
+        iptables -A "$IPTABLES_CHAIN" -d "$net" -j ACCEPT || return 1
+    done
+    iptables -A "$IPTABLES_CHAIN" -m owner --uid-owner "$TOR_UID" -j ACCEPT || return 1
+    iptables -A "$IPTABLES_CHAIN" -p tcp --syn -j ACCEPT || return 1
+    iptables -A "$IPTABLES_CHAIN" -j DROP || return 1
+
+    iptables -t nat -C OUTPUT -j "$NAT_CHAIN" 2>/dev/null ||
+        iptables -t nat -I OUTPUT 1 -j "$NAT_CHAIN" || return 1
+    iptables -C OUTPUT -j "$IPTABLES_CHAIN" 2>/dev/null ||
+        iptables -I OUTPUT 1 -j "$IPTABLES_CHAIN" || return 1
+}
+
+remove_iptables_rules() {
+    local failed=0
+    local chain table
+    while iptables -C OUTPUT -j "$IPTABLES_CHAIN" >/dev/null 2>&1; do
+        iptables -D OUTPUT -j "$IPTABLES_CHAIN" || return 1
+    done
+    while iptables -t nat -C OUTPUT -j "$NAT_CHAIN" >/dev/null 2>&1; do
+        iptables -t nat -D OUTPUT -j "$NAT_CHAIN" || return 1
+    done
+    for chain in "$IPTABLES_CHAIN" "$NAT_CHAIN"; do
+        table="filter"
+        [[ "$chain" == "$NAT_CHAIN" ]] && table="nat"
+        if iptables -t "$table" -S "$chain" >/dev/null 2>&1; then
+            iptables -t "$table" -F "$chain" || failed=1
+            iptables -t "$table" -X "$chain" || failed=1
+        fi
+    done
+    return "$failed"
+}
+
+# ---------- Start ----------
 cmd_start() {
     require_root
-    require_cmds tor iptables curl
+    require_cmds tor iptables curl ss systemctl
     print_banner
 
     if is_active; then
+        if [[ ! -f "$BACKEND_FILE" ]] || [[ "$(cat "$BACKEND_FILE")" != "chains" ]]; then
+            die "Legacy Tor routing is marked active. Run 'stop' to restore its saved firewall rules before starting again."
+        fi
         warn "Already active. Use '${C_CYAN}restart${C_RESET}' to change identity."
         return 0
     fi
 
-    spinner_run "Restarting Tor service" -- systemctl restart tor
-    wait_for_tor_bootstrap 60
-    wait_for_ports_listening
-
     ensure_state_dir
-    log "Saving current iptables rules..."
-    iptables-save > "$IPTABLES_SAVE_PATH"
+    if [[ -f "$BACKEND_FILE" ]] && [[ "$(cat "$BACKEND_FILE")" == "chains" ]]; then
+        remove_iptables_rules || die "Could not remove stale torsystem IPv4 chains; run 'stop' before retrying."
+        restore_ipv6 || die "Could not remove stale torsystem IPv6 rules; run 'stop' before retrying."
+    else
+        if iptables -t nat -S "$NAT_CHAIN" >/dev/null 2>&1 ||
+            iptables -S "$IPTABLES_CHAIN" >/dev/null 2>&1; then
+            die "A reserved torsystem firewall chain already exists without an ownership marker; refusing to modify it."
+        fi
+        if command -v ip6tables >/dev/null 2>&1 &&
+            ip6tables -S "$IP6TABLES_CHAIN" >/dev/null 2>&1; then
+            die "A reserved torsystem IPv6 chain already exists without an ownership marker; refusing to modify it."
+        fi
+    fi
 
-    iptables -F
-    iptables -t nat -F
+    spinner_run "Restarting Tor service" -- systemctl restart tor
+    wait_for_tor_bootstrap 60 || die "Tor did not finish bootstrapping; routing was not enabled."
+    wait_for_ports_listening || die "Tor's transparent proxy ports are not listening; routing was not enabled."
 
-    log "Applying routing rules to Tor..."
-    iptables -t nat -A OUTPUT -m owner --uid-owner "$TOR_UID" -j RETURN
-    iptables -t nat -A OUTPUT -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-    iptables -t nat -A OUTPUT -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT"
-
-    for net in "${NON_TOR_NETS[@]}"; do
-        iptables -t nat -A OUTPUT -d "$net" -j RETURN
-    done
-
-    iptables -t nat -A OUTPUT -p tcp --syn -j REDIRECT --to-ports "$TRANS_PORT"
-
-    iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-    iptables -A OUTPUT -o lo -j ACCEPT
-    for net in "${NON_TOR_NETS[@]}"; do
-        iptables -A OUTPUT -d "$net" -j ACCEPT
-    done
-    iptables -A OUTPUT -m owner --uid-owner "$TOR_UID" -j ACCEPT
-    iptables -A OUTPUT -p tcp --syn -j ACCEPT
-    iptables -A OUTPUT -j DROP
-
-    block_ipv6_leaks
+    printf '%s\n' "chains" > "$BACKEND_FILE"
+    printf '%s\n' "starting" > "$STATE_FILE"
+    if ! apply_iptables_rules || ! block_ipv6_leaks; then
+        warn "Firewall setup failed; removing torsystem-owned rules."
+        if remove_iptables_rules && restore_ipv6; then
+            printf '%s\n' "inactive" > "$STATE_FILE"
+            rm -f "$BACKEND_FILE"
+        else
+            warn "Cleanup was incomplete; run 'stop' to remove remaining torsystem rules."
+        fi
+        die "Tor routing was not enabled because firewall setup failed."
+    fi
 
     echo "active" > "$STATE_FILE"
     echo ""
-    ok "${C_BOLD}${C_GREEN}Tor routing is now ACTIVE.${C_RESET} All TCP + DNS traffic is anonymized."
+    ok "${C_BOLD}${C_GREEN}Tor routing is now ACTIVE.${C_RESET} External IPv4 TCP and DNS go through Tor; private networks are exempt and other UDP is blocked."
     echo ""
     cmd_status --no-banner
 }
@@ -363,15 +432,35 @@ cmd_stop() {
     print_banner
     ensure_state_dir
 
-    spinner_run "Flushing iptables rules" -- bash -c "iptables -F && iptables -t nat -F"
-
-    if [[ -f "$IPTABLES_SAVE_PATH" ]]; then
-        spinner_run "Restoring previous iptables rules" -- bash -c "iptables-restore < '$IPTABLES_SAVE_PATH'"
+    local current_state=""
+    [[ -f "$STATE_FILE" ]] && current_state="$(cat "$STATE_FILE")"
+    if [[ "$current_state" != "active" ]] &&
+        { [[ ! -f "$BACKEND_FILE" ]] || [[ "$(cat "$BACKEND_FILE")" != "chains" ]]; }; then
+        log "Tor routing is not marked active; leaving firewall rules unchanged."
+        return 0
     fi
 
-    restore_ipv6
+    if [[ -f "$BACKEND_FILE" ]] && [[ "$(cat "$BACKEND_FILE")" == "chains" ]]; then
+        if ! remove_iptables_rules || ! restore_ipv6; then
+            die "Could not remove all torsystem firewall rules; state was retained for recovery."
+        fi
+    else
+        warn "Legacy firewall setup detected; restoring its saved firewall snapshots."
+        if [[ -f "$IPTABLES_SAVE_PATH" ]]; then
+            spinner_run "Restoring previous IPv4 firewall rules" -- \
+                iptables-restore < "$IPTABLES_SAVE_PATH"
+        else
+            die "Legacy IPv4 firewall backup is missing; refusing to flush firewall rules."
+        fi
+        if command -v ip6tables-restore >/dev/null 2>&1 &&
+            [[ -f "$IP6TABLES_SAVE_PATH" ]]; then
+            spinner_run "Restoring previous IPv6 firewall rules" -- \
+                ip6tables-restore < "$IP6TABLES_SAVE_PATH"
+        fi
+    fi
 
     echo "inactive" > "$STATE_FILE"
+    rm -f "$BACKEND_FILE"
     echo ""
     ok "${C_BOLD}Back to normal networking.${C_RESET}"
 }
@@ -425,9 +514,12 @@ cmd_status() {
 # Prints the JSON response on success; returns curl's exit code on failure.
 _tor_check_fetch() {
     local resp curl_status
-    resp=$(curl -s --max-time 20 --retry 2 --retry-delay 2 \
-        https://check.torproject.org/api/ip 2>/dev/null)
-    curl_status=$?
+    if resp=$(curl -fsS --max-time 20 --retry 2 --retry-delay 2 \
+        https://check.torproject.org/api/ip 2>/dev/null); then
+        curl_status=0
+    else
+        curl_status=$?
+    fi
     if [[ $curl_status -eq 0 && -n "$resp" ]]; then
         echo "$resp"
         return 0
@@ -437,8 +529,8 @@ _tor_check_fetch() {
     # ISPs/networks even when Tor routing works fine. Confirm at least that
     # traffic is going out somewhere, and note the fallback was used.
     local ip
-    ip=$(curl -s --max-time 20 --retry 2 --retry-delay 2 https://api.ipify.org 2>/dev/null)
-    if [[ -n "$ip" ]]; then
+    if ip=$(curl -fsS --max-time 20 --retry 2 --retry-delay 2 https://api.ipify.org 2>/dev/null) &&
+        [[ -n "$ip" ]]; then
         echo "{\"IsTor\":\"unknown (check.torproject.org unreachable, used fallback)\",\"IP\":\"$ip\"}"
         return 0
     fi
@@ -467,8 +559,11 @@ cmd_check() {
     require_cmds curl
     log "Verifying traffic is routed through Tor..."
     local resp curl_status
-    resp=$(_tor_check_fetch)
-    curl_status=$?
+    if resp=$(_tor_check_fetch); then
+        curl_status=0
+    else
+        curl_status=$?
+    fi
     if [[ $curl_status -ne 0 || -z "$resp" ]]; then
         _tor_check_diagnose "$curl_status"
         echo ""
@@ -485,6 +580,7 @@ cmd_check() {
         warn "check.torproject.org was unreachable, so Tor exit status could not be confirmed directly."
         warn "A fallback IP lookup succeeded, meaning routing works, but this does NOT confirm it's via Tor."
         echo -e "    ${C_DIM}journalctl -u tor -n 50${C_RESET}          (Tor bootstrap / errors)"
+        return 2
     else
         err "${C_RED}${C_BOLD}Warning:${C_RESET} traffic is NOT exiting through Tor — possible leak."
         echo ""
@@ -492,7 +588,9 @@ cmd_check() {
         echo -e "    ${C_DIM}journalctl -u tor -n 50${C_RESET}          (Tor bootstrap / errors)"
         echo -e "    ${C_DIM}ss -tlnp | grep -E '9040|5353'${C_RESET}   (TransPort / DNSPort listening?)"
         echo -e "    ${C_DIM}sudo iptables -t nat -L -n -v${C_RESET}    (rules actually applied?)"
+        return 1
     fi
+    return 0
 }
 
 
@@ -504,14 +602,19 @@ set_torrc_exit_node() {
     require_root
     require_cmds tor
 
-    # Remove any exit-node lines we previously added.
-    sed -i '/^ExitNodes /d; /^StrictNodes /d' "$TORRC_PATH"
+    if [[ -n "$code" && ! "$code" =~ ^[A-Z]{2}$ ]]; then
+        die "Exit country must be a two-letter uppercase country code."
+    fi
+
+    sed -i '/^# torsystem-exit-node-begin$/,/^# torsystem-exit-node-end$/d' "$TORRC_PATH"
 
     if [[ -n "$code" ]]; then
         log "Setting preferred exit country to: ${C_BOLD}$code${C_RESET}"
         cat >> "$TORRC_PATH" <<EOF
+# torsystem-exit-node-begin
 ExitNodes {$code}
 StrictNodes 1
+# torsystem-exit-node-end
 EOF
     else
         log "Clearing exit node preference (any country)."
@@ -535,11 +638,15 @@ _tui_run_and_show() {
     local tmp
     tmp="$(mktemp)"
 
-    ( "$@" ) > "$tmp" 2>&1
-    local status=$?
+    local status=0
+    if ( "$@" ) > "$tmp" 2>&1; then
+        status=0
+    else
+        status=$?
+    fi
 
     sed -ri 's/\x1B\[[0-9;]*[a-zA-Z]//g; s/\r//g' "$tmp" 2>/dev/null || true
-    "$backend" --title "$title" --textbox "$tmp" 25 90
+    "$backend" --title "$title" --textbox "$tmp" 25 90 || true
     rm -f "$tmp"
     return $status
 }
@@ -566,7 +673,7 @@ cmd_tui() {
 
     while true; do
         local choice exitstatus
-        choice=$("$backend" --title "torsystem — Tor Network Control" \
+        if choice=$("$backend" --title "torsystem — Tor Network Control" \
             --menu "Choose an action:" 21 72 9 \
             "1" "Install prerequisites"                 \
             "2" "Start routing through Tor"              \
@@ -576,24 +683,27 @@ cmd_tui() {
             "6" "Run leak check"                              \
             "7" "Advanced settings"                            \
             "8" "Exit" \
-            3>&1 1>&2 2>&3)
-        exitstatus=$?
+            3>&1 1>&2 2>&3); then
+            exitstatus=0
+        else
+            exitstatus=$?
+        fi
 
         if [[ $exitstatus -ne 0 ]]; then
             break
         fi
 
         case "$choice" in
-            1) _tui_run_and_show "$backend" "Installing prerequisites..." cmd_install ;;
-            2) _tui_run_and_show "$backend" "Starting Tor routing..." cmd_start ;;
+            1) _tui_run_and_show "$backend" "Installing prerequisites..." cmd_install || true ;;
+            2) _tui_run_and_show "$backend" "Starting Tor routing..." cmd_start || true ;;
             3)
                 if _tui_confirm "$backend" "Stop Tor routing and restore normal networking?"; then
-                    _tui_run_and_show "$backend" "Stopping..." cmd_stop
+                    _tui_run_and_show "$backend" "Stopping..." cmd_stop || true
                 fi
                 ;;
-            4) _tui_run_and_show "$backend" "Getting new Tor identity..." cmd_restart ;;
-            5) _tui_run_and_show "$backend" "Status" cmd_status ;;
-            6) _tui_run_and_show "$backend" "Leak check" cmd_check ;;
+            4) _tui_run_and_show "$backend" "Getting new Tor identity..." cmd_restart || true ;;
+            5) _tui_run_and_show "$backend" "Status" cmd_status || true ;;
+            6) _tui_run_and_show "$backend" "Leak check" cmd_check || true ;;
             7) cmd_tui_advanced "$backend" ;;
             8) break ;;
         esac
@@ -606,7 +716,7 @@ cmd_tui_advanced() {
     local backend="$1"
     while true; do
         local choice exitstatus
-        choice=$("$backend" --title "Advanced Settings" \
+        if choice=$("$backend" --title "Advanced Settings" \
             --menu "Preferred exit node country:" 22 68 11 \
             "DE" "Germany"                     \
             "NL" "Netherlands"                  \
@@ -618,8 +728,11 @@ cmd_tui_advanced() {
             "CUSTOM" "Enter a custom country code..."   \
             "ANY"    "Any country (clear preference)"    \
             "BACK"   "Back to main menu" \
-            3>&1 1>&2 2>&3)
-        exitstatus=$?
+            3>&1 1>&2 2>&3); then
+            exitstatus=0
+        else
+            exitstatus=$?
+        fi
 
         if [[ $exitstatus -ne 0 ]] || [[ "$choice" == "BACK" ]]; then
             break
@@ -627,25 +740,28 @@ cmd_tui_advanced() {
 
         case "$choice" in
             ANY)
-                _tui_run_and_show "$backend" "Clearing exit node preference..." set_torrc_exit_node ""
+                _tui_run_and_show "$backend" "Clearing exit node preference..." set_torrc_exit_node "" || true
                 ;;
             CUSTOM)
                 local code custom_status
-                code=$("$backend" --title "Custom Exit Node" \
+                if code=$("$backend" --title "Custom Exit Node" \
                     --inputbox "Enter a 2-letter country code (e.g. DE, NL, JP):" 10 60 \
-                    3>&1 1>&2 2>&3)
-                custom_status=$?
+                    3>&1 1>&2 2>&3); then
+                    custom_status=0
+                else
+                    custom_status=$?
+                fi
                 if [[ $custom_status -eq 0 && -n "$code" ]]; then
-                    code="$(echo "$code" | tr '[:lower:]' '[:upper:]' | tr -cd 'A-Z')"
-                    if [[ ${#code} -eq 2 ]]; then
-                        _tui_run_and_show "$backend" "Setting exit node to $code..." set_torrc_exit_node "$code"
+                    code="$(printf '%s' "$code" | tr '[:lower:]' '[:upper:]')"
+                    if [[ "$code" =~ ^[A-Z]{2}$ ]]; then
+                        _tui_run_and_show "$backend" "Setting exit node to $code..." set_torrc_exit_node "$code" || true
                     else
                         "$backend" --title "Invalid input" --msgbox "Please enter exactly 2 letters (ISO country code), e.g. DE or JP." 9 60
                     fi
                 fi
                 ;;
             *)
-                _tui_run_and_show "$backend" "Setting exit node to $choice..." set_torrc_exit_node "$choice"
+                _tui_run_and_show "$backend" "Setting exit node to $choice..." set_torrc_exit_node "$choice" || true
                 ;;
         esac
     done
