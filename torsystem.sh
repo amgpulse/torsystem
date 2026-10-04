@@ -40,6 +40,7 @@ detect_tor_uid() {
 TOR_UID="$(detect_tor_uid)"
 TRANS_PORT=9040
 DNS_PORT=5353
+TOR_CONTROL_PORT=9051
 VIRT_NET="10.192.0.0/10"
 NON_TOR_NETS=("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "$VIRT_NET")
 
@@ -101,11 +102,10 @@ is_active() {
         [[ "$(cat "$STATE_FILE")" == "active" ]] || return 1
     if [[ -f "$BACKEND_FILE" ]] && [[ "$(cat "$BACKEND_FILE")" == "chains" ]]; then
         command -v iptables >/dev/null 2>&1 || return 1
+        command -v ip6tables >/dev/null 2>&1 || return 1
         iptables -C OUTPUT -j "$IPTABLES_CHAIN" >/dev/null 2>&1 || return 1
         iptables -t nat -C OUTPUT -j "$NAT_CHAIN" >/dev/null 2>&1 || return 1
-        if command -v ip6tables >/dev/null 2>&1; then
-            ip6tables -C OUTPUT -j "$IP6TABLES_CHAIN" >/dev/null 2>&1 || return 1
-        fi
+        ip6tables -C OUTPUT -j "$IP6TABLES_CHAIN" >/dev/null 2>&1 || return 1
         return 0
     else
         return 0
@@ -253,14 +253,14 @@ cmd_install() {
     case "$pm" in
         pacman)
             spinner_run "Syncing package databases" -- pacman -Sy --noconfirm
-            spinner_run "Installing tor, iptables, curl, iproute2" -- pacman -S --noconfirm --needed tor iptables curl iproute2
+        spinner_run "Installing tor, iptables, curl, iproute2, python" -- pacman -S --noconfirm --needed tor iptables curl iproute2 python
             ;;
         apt)
             spinner_run "Updating package lists" -- apt-get update -qq
-            spinner_run "Installing tor, iptables, curl, iproute2" -- apt-get install -y tor iptables curl iproute2
+        spinner_run "Installing tor, iptables, curl, iproute2, python3" -- apt-get install -y tor iptables curl iproute2 python3
             ;;
         dnf)
-            spinner_run "Installing tor, iptables, curl, iproute" -- dnf install -y tor iptables curl iproute
+        spinner_run "Installing tor, iptables, curl, iproute, python3" -- dnf install -y tor iptables curl iproute python3
             ;;
     esac
 
@@ -286,6 +286,16 @@ EOF
         log "torrc settings already present, skipping."
     fi
 
+    sed -i '/^## torsystem-control-managed$/,/^## torsystem-control-managed-end$/d' "$TORRC_PATH"
+    cat >> "$TORRC_PATH" <<EOF
+
+## torsystem-control-managed
+ControlPort 127.0.0.1:$TOR_CONTROL_PORT
+CookieAuthentication 1
+## torsystem-control-managed-end
+EOF
+    ok "Configured the localhost Tor control port with cookie authentication."
+
     if ! systemctl enable tor >/dev/null 2>&1; then
         warn "Could not enable Tor at boot; you may need to enable the tor service manually."
     fi
@@ -300,8 +310,8 @@ EOF
 # Tor doesn't support here). No IPv6 = no IPv6 leak.
 block_ipv6_leaks() {
     if ! command -v ip6tables >/dev/null 2>&1; then
-        warn "ip6tables not found — cannot block IPv6. If this system has IPv6 enabled, it may bypass Tor."
-        return 0
+        err "ip6tables is required to prevent IPv6 traffic from bypassing Tor."
+        return 1
     fi
 
     log "Blocking outbound IPv6 traffic (Tor routing here supports IPv4 only)..."
@@ -314,7 +324,8 @@ block_ipv6_leaks() {
 
 restore_ipv6() {
     if ! command -v ip6tables >/dev/null 2>&1; then
-        return 0
+        err "ip6tables is unavailable; cannot remove torsystem IPv6 rules."
+        return 1
     fi
 
     while ip6tables -C OUTPUT -j "$IP6TABLES_CHAIN" >/dev/null 2>&1; do
@@ -324,6 +335,26 @@ restore_ipv6() {
         ip6tables -F "$IP6TABLES_CHAIN" || return 1
         ip6tables -X "$IP6TABLES_CHAIN" || return 1
     fi
+}
+
+save_firewall_snapshots() {
+    local ipv4_tmp ipv6_tmp
+    ipv4_tmp="$(mktemp "$STATE_DIR/iptables.XXXXXX")" || return 1
+    ipv6_tmp="$(mktemp "$STATE_DIR/ip6tables.XXXXXX")" || {
+        rm -f "$ipv4_tmp"
+        return 1
+    }
+
+    if ! iptables-save > "$ipv4_tmp" || ! ip6tables-save > "$ipv6_tmp"; then
+        rm -f "$ipv4_tmp" "$ipv6_tmp"
+        return 1
+    fi
+    if ! mv -f "$ipv4_tmp" "$IPTABLES_SAVE_PATH" ||
+        ! mv -f "$ipv6_tmp" "$IP6TABLES_SAVE_PATH"; then
+        rm -f "$ipv4_tmp" "$ipv6_tmp"
+        return 1
+    fi
+    chmod 600 "$IPTABLES_SAVE_PATH" "$IP6TABLES_SAVE_PATH"
 }
 
 apply_iptables_rules() {
@@ -376,7 +407,7 @@ remove_iptables_rules() {
 # ---------- Start ----------
 cmd_start() {
     require_root
-    require_cmds tor iptables curl ss systemctl
+    require_cmds tor iptables iptables-save ip6tables ip6tables-save curl ss systemctl
     print_banner
 
     if is_active; then
@@ -406,6 +437,8 @@ cmd_start() {
     wait_for_tor_bootstrap 60 || die "Tor did not finish bootstrapping; routing was not enabled."
     wait_for_ports_listening || die "Tor's transparent proxy ports are not listening; routing was not enabled."
 
+    save_firewall_snapshots ||
+        die "Could not save the current IPv4/IPv6 firewall snapshots; routing was not enabled."
     printf '%s\n' "chains" > "$BACKEND_FILE"
     printf '%s\n' "starting" > "$STATE_FILE"
     if ! apply_iptables_rules || ! block_ipv6_leaks; then
@@ -446,14 +479,16 @@ cmd_stop() {
         fi
     else
         warn "Legacy firewall setup detected; restoring its saved firewall snapshots."
-        if [[ -f "$IPTABLES_SAVE_PATH" ]]; then
-            spinner_run "Restoring previous IPv4 firewall rules" -- \
-                iptables-restore < "$IPTABLES_SAVE_PATH"
-        else
+        if [[ ! -f "$IPTABLES_SAVE_PATH" ]]; then
             die "Legacy IPv4 firewall backup is missing; refusing to flush firewall rules."
         fi
         if command -v ip6tables-restore >/dev/null 2>&1 &&
-            [[ -f "$IP6TABLES_SAVE_PATH" ]]; then
+            [[ ! -f "$IP6TABLES_SAVE_PATH" ]]; then
+            die "Legacy IPv6 firewall backup is missing; refusing to mark routing inactive."
+        fi
+        spinner_run "Restoring previous IPv4 firewall rules" -- \
+            iptables-restore < "$IPTABLES_SAVE_PATH"
+        if command -v ip6tables-restore >/dev/null 2>&1; then
             spinner_run "Restoring previous IPv6 firewall rules" -- \
                 ip6tables-restore < "$IP6TABLES_SAVE_PATH"
         fi
@@ -468,20 +503,55 @@ cmd_stop() {
 # ---------- Restart / new identity ----------
 cmd_restart() {
     require_root
+    require_cmds python3
     print_banner
     if ! is_active; then
         die "Not currently active. Run '${C_CYAN}start${C_RESET}' first."
     fi
 
-    if command -v nc >/dev/null 2>&1; then
-        printf 'AUTHENTICATE ""\r\nSIGNAL NEWNYM\r\nQUIT\r\n' | nc -q 1 127.0.0.1 9051 2>/dev/null || true
+    if ! python3 - "$TOR_CONTROL_PORT" <<'PY'
+import re
+import socket
+import sys
+
+port = int(sys.argv[1])
+
+with socket.create_connection(("127.0.0.1", port), timeout=5) as control:
+    control.settimeout(5)
+    reader = control.makefile("r", encoding="utf-8", newline="\r\n")
+
+    def command(text):
+        control.sendall((text + "\r\n").encode("ascii"))
+        lines = []
+        while True:
+            line = reader.readline()
+            if not line:
+                raise RuntimeError("Tor closed the control connection")
+            lines.append(line)
+            if line.startswith("250 "):
+                return "".join(lines)
+            if not line.startswith("250-"):
+                raise RuntimeError("Tor control command failed: " + "".join(lines).strip())
+
+    protocol = command("PROTOCOLINFO 1")
+    match = re.search(r'COOKIEFILE="((?:\\.|[^"])*)"', protocol)
+    if not match:
+        raise RuntimeError("Tor did not provide a cookie file for authentication")
+    cookie_path = match.group(1).replace(r"\"", '"').replace(r"\\", "\\")
+    with open(cookie_path, "rb") as cookie_file:
+        cookie = cookie_file.read()
+    if len(cookie) != 32:
+        raise RuntimeError("Tor control authentication cookie has an unexpected length")
+    command("AUTHENTICATE " + cookie.hex())
+    command("SIGNAL NEWNYM")
+    command("QUIT")
+PY
+    then
+        die "Could not authenticate to Tor's control port or request a new identity."
     fi
-    spinner_run "Restarting Tor for a new identity" -- systemctl restart tor
-    wait_for_tor_bootstrap 60
-    wait_for_ports_listening
 
     echo ""
-    ok "${C_BOLD}New Tor identity acquired.${C_RESET}"
+    ok "${C_BOLD}Tor accepted the NEWNYM request.${C_RESET} Existing connections may continue on their current circuits."
     echo ""
     cmd_status --no-banner
 }
