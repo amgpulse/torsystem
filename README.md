@@ -145,3 +145,14 @@ MIT — see [LICENSE](LICENSE).
 ## ⚖️ Disclaimer
 
 This tool is provided for legitimate privacy and anonymity purposes. You are responsible for complying with the laws and terms of service applicable in your jurisdiction and network. The authors are not responsible for misuse.
+---
+
+<div align="center">
+
+**Made it because I wanted it to exist.**
+
+If it saves you the same headaches it saved me, that's enough.
+
+Feedback, issues, and PRs are genuinely welcome.
+
+</div>
