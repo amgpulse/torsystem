@@ -9,8 +9,11 @@
 #   sudo ./torsystem.sh restart     Request a new Tor identity (new exit IP)
 #   sudo ./torsystem.sh status      Show current status and exit IP
 #   sudo ./torsystem.sh check       Test for DNS/IP leaks
+#   ./torsystem.sh about            Show torsystem version
 #
 set -euo pipefail
+
+VERSION="1.4.0"
 
 # ---------- Colors & style ----------
 if [[ -t 1 ]]; then
@@ -59,14 +62,12 @@ IP6TABLES_CHAIN="TORSYSTEM6_OUT"
 print_banner() {
     echo -e "${C_PURPLE}${C_BOLD}"
     cat <<'EOF'
-  _______            _____           _
- |__   __|          / ____|         | |
-    | | ___  _ __  | (___  _   _ ___| |_ ___ _ __ ___
-    | |/ _ \| '__|  \___ \| | | / __| __/ _ \ '_ ` _ \
-    | | (_) | |      ____) | |_| \__ \ ||  __/ | | | | |
-    |_|\___/|_|     |_____/ \__, |___/\__\___|_| |_| |_|
-                              __/ |
-                             |___/
+████████╗ ██████╗ ██████╗ ███████╗██╗   ██╗███████╗████████╗███████╗███╗   ███╗
+╚══██╔══╝██╔═══██╗██╔══██╗██╔════╝╚██╗ ██╔╝██╔════╝╚══██╔══╝██╔════╝████╗ ████║
+   ██║   ██║   ██║██████╔╝███████╗ ╚████╔╝ ███████╗   ██║   █████╗  ██╔████╔██║
+   ██║   ██║   ██║██╔══██╗╚════██║  ╚██╔╝  ╚════██║   ██║   ██╔══╝  ██║╚██╔╝██║
+   ██║   ╚██████╔╝██║  ██║███████║   ██║   ███████║   ██║   ███████╗██║ ╚═╝ ██║
+   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚══════╝   ╚═╝   ╚══════╝   ╚═╝   ╚══════╝╚═╝     ╚═╝
 EOF
     echo -e "${C_RESET}${C_GRAY}         route TCP and DNS traffic through Tor${C_RESET}"
     echo ""
@@ -726,6 +727,11 @@ _tui_confirm() {
     "$backend" --title "Confirm" --yesno "$msg" 10 60
 }
 
+_tui_about() {
+    local backend="$1"
+    "$backend" --title "About torsystem" --msgbox "torsystem v${VERSION}" 8 40
+}
+
 cmd_tui() {
     local backend=""
     if command -v whiptail >/dev/null 2>&1; then
@@ -744,7 +750,7 @@ cmd_tui() {
     while true; do
         local choice exitstatus
         if choice=$("$backend" --title "torsystem — Tor Network Control" \
-            --menu "Choose an action:" 21 72 9 \
+            --menu "Choose an action:" 22 72 10 \
             "1" "Install prerequisites"                 \
             "2" "Start routing through Tor"              \
             "3" "Stop routing (restore normal network)"   \
@@ -752,7 +758,8 @@ cmd_tui() {
             "5" "Show status"                                \
             "6" "Run leak check"                              \
             "7" "Advanced settings"                            \
-            "8" "Exit" \
+            "8" "About / version"                              \
+            "9" "Exit" \
             3>&1 1>&2 2>&3); then
             exitstatus=0
         else
@@ -775,7 +782,8 @@ cmd_tui() {
             5) _tui_run_and_show "$backend" "Status" cmd_status || true ;;
             6) _tui_run_and_show "$backend" "Leak check" cmd_check || true ;;
             7) cmd_tui_advanced "$backend" ;;
-            8) break ;;
+            8) _tui_about "$backend" || true ;;
+            9) break ;;
         esac
     done
     clear
@@ -838,6 +846,10 @@ cmd_tui_advanced() {
 }
 
 # ---------- Usage ----------
+cmd_about() {
+    printf 'torsystem v%s\n' "$VERSION"
+}
+
 usage() {
     print_banner
     cat <<EOF
@@ -850,6 +862,7 @@ usage() {
     ${C_CYAN}restart${C_RESET}     Request a new Tor identity
     ${C_CYAN}status${C_RESET}      Show current status and exit IP
     ${C_CYAN}check${C_RESET}       Verify traffic is really passing through Tor
+    ${C_CYAN}about${C_RESET}       Show torsystem version
     ${C_CYAN}tui${C_RESET}         Launch an interactive menu (whiptail/dialog)
 
 EOF
@@ -865,6 +878,7 @@ main() {
         restart)  cmd_restart ;;
         status)   cmd_status ;;
         check)    cmd_check ;;
+        about)    cmd_about ;;
         tui)      cmd_tui ;;
         *)        usage; exit 1 ;;
     esac
