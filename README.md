@@ -27,7 +27,7 @@
 
 - 🧅 **System-wide routing** — all TCP + DNS traffic transparently redirected through Tor via `iptables`
 - 🛡️ **Leak-proof by default** — a final `DROP` rule blocks anything that isn't routed through Tor instead of silently leaking it, and all IPv6 traffic is blocked outright (Tor only carries IPv4 here)
-- ⏳ **Bootstrap-aware** — waits for Tor to actually finish bootstrapping (polls `journalctl`) before flipping traffic over, instead of a blind sleep
+- ⏳ **Bootstrap-aware** — checks Tor's authenticated ControlPort for bootstrap progress, with `journalctl` as a fallback, before enabling routing
 - 🔄 **One-command identity rotation** — get a fresh exit IP with `restart`
 - 🔍 **Built-in leak check** — verifies against `check.torproject.org` that you're really exiting through Tor
 - 🐧 **Multi-distro** — auto-detects `pacman`, `apt`, or `dnf`

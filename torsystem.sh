@@ -10,10 +10,11 @@
 #   sudo ./torsystem.sh status      Show current status and exit IP
 #   sudo ./torsystem.sh check       Test for DNS/IP leaks
 #   ./torsystem.sh about            Show torsystem version
+#   ./torsystem.sh update           Check for a newer release (does not install)
 #
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 # ---------- Colors & style ----------
 if [[ -t 1 ]]; then
@@ -169,19 +170,64 @@ spinner_run() {
     return $status
 }
 
+# Query Tor's authenticated control port for its current bootstrap percentage.
+get_tor_bootstrap_progress() {
+    python3 - "$TOR_CONTROL_PORT" <<'PY' 2>/dev/null
+import re
+import socket
+import sys
+
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=2) as control:
+    control.settimeout(2)
+    reader = control.makefile("r", encoding="utf-8", newline="\r\n")
+
+    def command(text):
+        control.sendall((text + "\r\n").encode("ascii"))
+        lines = []
+        while True:
+            line = reader.readline()
+            if not line:
+                raise RuntimeError("Tor closed the control connection")
+            lines.append(line)
+            if line.startswith("250 "):
+                return "".join(lines)
+            if not line.startswith("250-"):
+                raise RuntimeError("Tor control command failed")
+
+    protocol = command("PROTOCOLINFO 1")
+    match = re.search(r'COOKIEFILE="((?:\\.|[^"])*)"', protocol)
+    if not match:
+        raise RuntimeError("Tor did not provide a cookie file")
+    cookie_path = match.group(1).replace(r"\"", '"').replace(r"\\", "\\")
+    with open(cookie_path, "rb") as cookie_file:
+        cookie = cookie_file.read()
+    if len(cookie) != 32:
+        raise RuntimeError("Invalid Tor control cookie")
+
+    command("AUTHENTICATE " + cookie.hex())
+    status = command("GETINFO status/bootstrap-phase")
+    progress = re.search(r"\bPROGRESS=(\d+)\b", status)
+    if progress:
+        print(progress.group(1))
+PY
+}
+
 # wait_for_tor_bootstrap [timeout_seconds]
-# Polls journalctl for "Bootstrapped 100%" instead of a fixed sleep.
+# Prefer the authenticated control port; fall back to systemd journal logs.
 # Routing is not enabled unless Tor finishes bootstrapping.
 wait_for_tor_bootstrap() {
-    local timeout="${1:-60}"
+    local timeout="${1:-180}"
     local waited=0
     local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
     local i=0
     local pct=""
 
     while (( waited < timeout )); do
-        pct=$(journalctl -u tor --no-pager -n 40 2>/dev/null |
-            grep -oP 'Bootstrapped \K[0-9]+(?=%)' | tail -1 || true)
+        pct="$(get_tor_bootstrap_progress || true)"
+        if [[ -z "$pct" ]]; then
+            pct=$(journalctl -u tor -u tor@default --no-pager -n 100 2>/dev/null |
+                grep -oP 'Bootstrapped \K[0-9]+(?=%)' | tail -1 || true)
+        fi
         if [[ "$pct" == "100" ]]; then
             if [[ -t 1 ]]; then printf "\r  ${C_GREEN}✔${C_RESET} Tor bootstrap complete (100%%)               \n"; fi
             return 0
@@ -197,7 +243,8 @@ wait_for_tor_bootstrap() {
 
     echo ""
     warn "Tor did not report 100% bootstrap within ${timeout}s."
-    warn "Check: ${C_DIM}journalctl -u tor -n 50${C_RESET}"
+    warn "Check: ${C_DIM}systemctl status tor tor@default --no-pager${C_RESET}"
+    warn "Logs:  ${C_DIM}journalctl -u tor -u tor@default -n 80 --no-pager${C_RESET}"
     return 1
 }
 
@@ -408,7 +455,7 @@ remove_iptables_rules() {
 # ---------- Start ----------
 cmd_start() {
     require_root
-    require_cmds tor iptables iptables-save ip6tables ip6tables-save curl ss systemctl
+    require_cmds tor iptables iptables-save ip6tables ip6tables-save curl ss systemctl python3
     print_banner
 
     if is_active; then
@@ -435,7 +482,7 @@ cmd_start() {
     fi
 
     spinner_run "Restarting Tor service" -- systemctl restart tor
-    wait_for_tor_bootstrap 60 || die "Tor did not finish bootstrapping; routing was not enabled."
+    wait_for_tor_bootstrap 180 || die "Tor did not finish bootstrapping; routing was not enabled."
     wait_for_ports_listening || die "Tor's transparent proxy ports are not listening; routing was not enabled."
 
     save_firewall_snapshots ||
@@ -692,7 +739,7 @@ EOF
     fi
 
     spinner_run "Restarting Tor to apply the change" -- systemctl restart tor
-    wait_for_tor_bootstrap 60
+    wait_for_tor_bootstrap 180
     wait_for_ports_listening
     echo ""
     ok "${C_BOLD}Exit node preference updated.${C_RESET}"
@@ -729,7 +776,25 @@ _tui_confirm() {
 
 _tui_about() {
     local backend="$1"
-    "$backend" --title "About torsystem" --msgbox "torsystem v${VERSION}" 8 40
+    while true; do
+        local choice exitstatus
+        if choice=$("$backend" --title "About torsystem" \
+            --menu "Installed version: torsystem v${VERSION}" 12 60 2 \
+            "check-update" "Check for update" \
+            "back" "Back" \
+            3>&1 1>&2 2>&3); then
+            exitstatus=0
+        else
+            exitstatus=$?
+        fi
+
+        if [[ $exitstatus -ne 0 ]] || [[ "$choice" == "back" ]]; then
+            break
+        fi
+        if [[ "$choice" == "check-update" ]]; then
+            _tui_run_and_show "$backend" "Update check" cmd_update || true
+        fi
+    done
 }
 
 cmd_tui() {
@@ -850,6 +915,65 @@ cmd_about() {
     printf 'torsystem v%s\n' "$VERSION"
 }
 
+cmd_update() {
+    require_cmds curl python3
+
+    local release_json update_info latest tag_url result
+    if ! release_json=$(curl -fsS --connect-timeout 5 --max-time 15 \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/amgpulse/torsystem/releases/latest"); then
+        err "Could not check GitHub for the latest release. Check your internet connection and try again."
+        return 1
+    fi
+
+    if ! update_info=$(printf '%s' "$release_json" | python3 -c '
+import json
+import re
+import sys
+
+try:
+    release = json.load(sys.stdin)
+except json.JSONDecodeError as error:
+    print(f"Invalid release response from GitHub: {error}", file=sys.stderr)
+    sys.exit(1)
+
+tag = release.get("tag_name")
+url = release.get("html_url")
+if not isinstance(tag, str) or not isinstance(url, str):
+    print("GitHub returned an invalid latest-release response.", file=sys.stderr)
+    sys.exit(1)
+match = re.fullmatch(r"v?([0-9]+)\.([0-9]+)\.([0-9]+)", tag)
+if not match or not url.startswith(
+    "https://github.com/amgpulse/torsystem/releases/tag/"
+):
+    print("GitHub returned an invalid latest-release response.", file=sys.stderr)
+    sys.exit(1)
+
+latest_version = tuple(map(int, match.groups()))
+current = tuple(map(int, sys.argv[1].split(".")))
+if latest_version > current:
+    result = "available"
+elif latest_version < current:
+    result = "ahead"
+else:
+    result = "current"
+print(f"{tag}\t{url}\t{result}")
+' "$VERSION"); then
+        err "Could not read the latest release information."
+        return 1
+    fi
+
+    IFS=$'\t' read -r latest tag_url result <<< "$update_info"
+    if [[ "$result" == "available" ]]; then
+        warn "A newer release is available: torsystem $latest (you have v$VERSION)."
+        printf '  Download: %s\n' "$tag_url"
+    elif [[ "$result" == "ahead" ]]; then
+        ok "torsystem v$VERSION is newer than the latest published release ($latest)."
+    else
+        ok "torsystem v$VERSION is up to date (latest: $latest)."
+    fi
+}
+
 usage() {
     print_banner
     cat <<EOF
@@ -863,6 +987,7 @@ usage() {
     ${C_CYAN}status${C_RESET}      Show current status and exit IP
     ${C_CYAN}check${C_RESET}       Verify traffic is really passing through Tor
     ${C_CYAN}about${C_RESET}       Show torsystem version
+    ${C_CYAN}update${C_RESET}      Check for a newer release (does not install it)
     ${C_CYAN}tui${C_RESET}         Launch an interactive menu (whiptail/dialog)
 
 EOF
@@ -879,6 +1004,7 @@ main() {
         status)   cmd_status ;;
         check)    cmd_check ;;
         about)    cmd_about ;;
+        update)   cmd_update ;;
         tui)      cmd_tui ;;
         *)        usage; exit 1 ;;
     esac
