@@ -27,11 +27,12 @@
 
 - 🧅 **System-wide routing** — all TCP + DNS traffic transparently redirected through Tor via `iptables`
 - 🛡️ **Leak-proof by default** — a final `DROP` rule blocks anything that isn't routed through Tor instead of silently leaking it, and all IPv6 traffic is blocked outright (Tor only carries IPv4 here)
+- 🔒 **Persistent kill switch** — the firewall is restored before networking on boot and stays fail-closed if Tor stops; only `stop` removes it
 - ⏳ **Bootstrap-aware** — checks Tor's authenticated ControlPort for bootstrap progress, with `journalctl` as a fallback, before enabling routing
 - 🔄 **One-command identity rotation** — get a fresh exit IP with `restart`
 - 🔍 **Built-in leak check** — verifies against `check.torproject.org` that you're really exiting through Tor
 - 🐧 **Multi-distro** — auto-detects `pacman`, `apt`, or `dnf`
-- ↩️ **Fully reversible** — `stop` restores your previous `iptables` rules exactly as they were
+- ↩️ **Reversible** — `stop` removes torsystem's rules and restores normal networking
 - 🎨 **Nice terminal UI** — ASCII banner, colors, spinners, and progress bars
 - 🖥️ **Optional menu-driven TUI** — `torsystem.sh tui` gives you a `whiptail`-based point-and-click menu, no flags to remember
 - 🌍 **Exit node country selection** — pick a preferred exit country from a quick list or enter a custom code, right from the TUI's Advanced Settings
@@ -56,6 +57,7 @@ sudo ./torsystem.sh install
 ```
 
 This installs `tor`, `iptables`, `curl`, and `iproute2`, and appends the required config to `/etc/tor/torrc` (your original `torrc` is backed up first, automatically).
+It also installs `torsystem` under `/usr/local/sbin` and enables a systemd unit that restores the kill switch before the network starts. Re-run `install` after replacing the script to update that boot-time copy.
 
 ## 🕹️ Usage
 
@@ -111,7 +113,8 @@ Picking a country updates `torrc` (`ExitNodes {XX}` + `StrictNodes 1`), restarts
 3. `iptables` then redirects all outgoing DNS to `DNSPort` and all new TCP connections to `TransPort`.
 4. Local/private networks (loopback, LAN ranges) are exempted so your local network keeps working.
 5. A final `DROP` rule blocks anything that didn't match a Tor rule — this is what prevents leaks.
-6. `stop` restores the exact `iptables` ruleset that existed right before `start` ran.
+6. The enabled `torsystem-killswitch.service` reapplies these rules before networking on boot whenever routing was active. Existing connections are not exempted, so they cannot continue outside Tor.
+7. `stop` removes torsystem's firewall rules and explicitly unlocks normal networking. Private/LAN IPv4 ranges remain exempt while routing is active.
 
 ## ⚠️ Limitations
 

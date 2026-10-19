@@ -11,6 +11,7 @@
 #   sudo ./torsystem.sh check       Test for DNS/IP leaks
 #   ./torsystem.sh about            Show torsystem version
 #   ./torsystem.sh update           Check for a newer release (does not install)
+#   After install, the kill switch is restored before networking on boot.
 #
 set -euo pipefail
 
@@ -39,9 +40,9 @@ detect_tor_uid() {
             return 0
         fi
     done
-    echo 100  # fallback
+    return 1
 }
-TOR_UID="$(detect_tor_uid)"
+TOR_UID=""
 TRANS_PORT=9040
 DNS_PORT=5353
 TOR_CONTROL_PORT=9051
@@ -50,6 +51,8 @@ NON_TOR_NETS=("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "$VIRT
 
 TORRC_PATH="/etc/tor/torrc"
 TORRC_BACKUP="/etc/tor/torrc.torsystem.bak"
+KILLSWITCH_SCRIPT_PATH="/usr/local/sbin/torsystem.sh"
+KILLSWITCH_SERVICE_PATH="/etc/systemd/system/torsystem-killswitch.service"
 IPTABLES_SAVE_PATH="/var/lib/torsystem/iptables.rules.bak"
 IP6TABLES_SAVE_PATH="/var/lib/torsystem/ip6tables.rules.bak"
 STATE_DIR="/var/lib/torsystem"
@@ -95,6 +98,11 @@ require_cmds() {
     fi
 }
 
+require_tor_uid() {
+    TOR_UID="$(detect_tor_uid)" ||
+        die "Could not find the Tor service account (debian-tor/tor/_tor/toranon)."
+}
+
 ensure_state_dir() {
     mkdir -p "$STATE_DIR"
 }
@@ -124,6 +132,36 @@ detect_pkg_manager() {
     else
         die "No supported package manager found (pacman/apt/dnf)."
     fi
+}
+
+install_killswitch_service() {
+    local source_path
+    source_path="$(readlink -f -- "$0")" ||
+        die "Could not resolve the torsystem script path."
+
+    install -d -m 755 "$(dirname "$KILLSWITCH_SCRIPT_PATH")"
+    if [[ "$source_path" != "$KILLSWITCH_SCRIPT_PATH" ]]; then
+        install -m 755 "$source_path" "$KILLSWITCH_SCRIPT_PATH"
+    fi
+
+    cat > "$KILLSWITCH_SERVICE_PATH" <<EOF
+[Unit]
+Description=torsystem persistent Tor kill switch
+DefaultDependencies=no
+After=local-fs.target
+Wants=network-pre.target
+Before=network-pre.target tor.service
+
+[Service]
+Type=oneshot
+ExecStart=$KILLSWITCH_SCRIPT_PATH boot-lock
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable torsystem-killswitch.service >/dev/null
 }
 
 # ---------- Spinner animation ----------
@@ -347,8 +385,10 @@ EOF
     if ! systemctl enable tor >/dev/null 2>&1; then
         warn "Could not enable Tor at boot; you may need to enable the tor service manually."
     fi
+    install_killswitch_service ||
+        die "Could not install/enable the persistent kill-switch service."
     echo ""
-    ok "${C_BOLD}Installation complete.${C_RESET} Run '${C_CYAN}start${C_RESET}' to go live."
+    ok "${C_BOLD}Installation complete.${C_RESET} Run '${C_CYAN}start${C_RESET}' to go live. The kill switch will be restored before networking on boot."
 }
 
 # ---------- IPv6 leak protection ----------
@@ -406,30 +446,32 @@ save_firewall_snapshots() {
 }
 
 apply_iptables_rules() {
-    iptables -t nat -N "$NAT_CHAIN" || return 1
     iptables -N "$IPTABLES_CHAIN" || return 1
 
-    iptables -t nat -A "$NAT_CHAIN" -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
-    iptables -t nat -A "$NAT_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
-    iptables -t nat -A "$NAT_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
-    for net in "${NON_TOR_NETS[@]}"; do
-        iptables -t nat -A "$NAT_CHAIN" -d "$net" -j RETURN || return 1
-    done
-    iptables -t nat -A "$NAT_CHAIN" -p tcp --syn -j REDIRECT --to-ports "$TRANS_PORT" || return 1
-
-    iptables -A "$IPTABLES_CHAIN" -m state --state ESTABLISHED,RELATED -j ACCEPT || return 1
     iptables -A "$IPTABLES_CHAIN" -o lo -j ACCEPT || return 1
     for net in "${NON_TOR_NETS[@]}"; do
         iptables -A "$IPTABLES_CHAIN" -d "$net" -j ACCEPT || return 1
     done
-    iptables -A "$IPTABLES_CHAIN" -m owner --uid-owner "$TOR_UID" -j ACCEPT || return 1
-    iptables -A "$IPTABLES_CHAIN" -p tcp --syn -j ACCEPT || return 1
+    if [[ -n "$TOR_UID" ]]; then
+        iptables -A "$IPTABLES_CHAIN" -m owner --uid-owner "$TOR_UID" -j ACCEPT || return 1
+    fi
     iptables -A "$IPTABLES_CHAIN" -j DROP || return 1
 
-    iptables -t nat -C OUTPUT -j "$NAT_CHAIN" 2>/dev/null ||
-        iptables -t nat -I OUTPUT 1 -j "$NAT_CHAIN" || return 1
     iptables -C OUTPUT -j "$IPTABLES_CHAIN" 2>/dev/null ||
         iptables -I OUTPUT 1 -j "$IPTABLES_CHAIN" || return 1
+
+    iptables -t nat -N "$NAT_CHAIN" || return 1
+    if [[ -n "$TOR_UID" ]]; then
+        iptables -t nat -A "$NAT_CHAIN" -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
+    fi
+    for net in "${NON_TOR_NETS[@]}"; do
+        iptables -t nat -A "$NAT_CHAIN" -d "$net" -j RETURN || return 1
+    done
+    iptables -t nat -A "$NAT_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    iptables -t nat -A "$NAT_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    iptables -t nat -A "$NAT_CHAIN" -p tcp --syn -j REDIRECT --to-ports "$TRANS_PORT" || return 1
+    iptables -t nat -C OUTPUT -j "$NAT_CHAIN" 2>/dev/null ||
+        iptables -t nat -I OUTPUT 1 -j "$NAT_CHAIN" || return 1
 }
 
 remove_iptables_rules() {
@@ -456,6 +498,7 @@ remove_iptables_rules() {
 cmd_start() {
     require_root
     require_cmds tor iptables iptables-save ip6tables ip6tables-save curl ss systemctl python3
+    require_tor_uid
     print_banner
 
     if is_active; then
@@ -489,7 +532,7 @@ cmd_start() {
         die "Could not save the current IPv4/IPv6 firewall snapshots; routing was not enabled."
     printf '%s\n' "chains" > "$BACKEND_FILE"
     printf '%s\n' "starting" > "$STATE_FILE"
-    if ! apply_iptables_rules || ! block_ipv6_leaks; then
+    if ! block_ipv6_leaks || ! apply_iptables_rules; then
         warn "Firewall setup failed; removing torsystem-owned rules."
         if remove_iptables_rules && restore_ipv6; then
             printf '%s\n' "inactive" > "$STATE_FILE"
@@ -505,6 +548,41 @@ cmd_start() {
     ok "${C_BOLD}${C_GREEN}Tor routing is now ACTIVE.${C_RESET} External IPv4 TCP and DNS go through Tor; private networks are exempt and other UDP is blocked."
     echo ""
     cmd_status --no-banner
+}
+
+# ---------- Persistent kill switch boot hook ----------
+cmd_boot_lock() {
+    require_root
+
+    local current_state="" backend=""
+    [[ -f "$STATE_FILE" ]] && current_state="$(cat "$STATE_FILE")"
+    [[ -f "$BACKEND_FILE" ]] && backend="$(cat "$BACKEND_FILE")"
+    if [[ "$backend" != "chains" ]] ||
+        { [[ "$current_state" != "active" ]] && [[ "$current_state" != "starting" ]]; }; then
+        return 0
+    fi
+
+    require_cmds iptables ip6tables
+    if ! TOR_UID="$(detect_tor_uid)"; then
+        TOR_UID=""
+        warn "Tor service account is missing; boot protection will block external IPv4 traffic."
+    fi
+    ensure_state_dir
+
+    if iptables -t nat -S "$NAT_CHAIN" >/dev/null 2>&1 ||
+        iptables -S "$IPTABLES_CHAIN" >/dev/null 2>&1; then
+        remove_iptables_rules ||
+            die "Could not clear stale torsystem IPv4 rules while restoring the boot kill switch."
+    fi
+    if ip6tables -S "$IP6TABLES_CHAIN" >/dev/null 2>&1; then
+        restore_ipv6 ||
+            die "Could not clear stale torsystem IPv6 rules while restoring the boot kill switch."
+    fi
+
+    block_ipv6_leaks ||
+        die "Could not restore IPv6 protection; the boot kill switch was not fully applied."
+    apply_iptables_rules ||
+        die "Could not restore IPv4 protection; the boot kill switch was not fully applied."
 }
 
 # ---------- Stop ----------
@@ -612,6 +690,12 @@ cmd_status() {
         echo -e "  Status: ${C_GREEN}${C_BOLD}ACTIVE${C_RESET} ✅"
     else
         echo -e "  Status: ${C_GRAY}${C_BOLD}INACTIVE${C_RESET} ⭕"
+    fi
+    if [[ -f "$KILLSWITCH_SERVICE_PATH" ]] &&
+        systemctl is-enabled --quiet torsystem-killswitch.service 2>/dev/null; then
+        echo -e "  Boot kill switch: ${C_GREEN}enabled${C_RESET}"
+    else
+        echo -e "  Boot kill switch: ${C_YELLOW}not installed/enabled${C_RESET} (run install)"
     fi
 
     if command -v curl >/dev/null 2>&1; then
@@ -999,6 +1083,7 @@ main() {
     case "$cmd" in
         install)  cmd_install ;;
         start)    cmd_start ;;
+        boot-lock) cmd_boot_lock ;;
         stop)     cmd_stop ;;
         restart)  cmd_restart ;;
         status)   cmd_status ;;
