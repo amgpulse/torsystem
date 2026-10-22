@@ -15,6 +15,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-blue)](#requirements)
 [![Made with Tor](https://img.shields.io/badge/powered%20by-Tor-7D4698?logo=torproject&logoColor=white)](https://www.torproject.org/)
+[![Changelog](https://img.shields.io/badge/changelog-v1.6.1-blue.svg)](CHANGELOG.md)
 
 </div>
 
@@ -133,6 +134,10 @@ All logic lives in isolated functions (`cmd_install`, `cmd_start`, `cmd_stop`, `
 - Add Tor bridge support for censored networks
 
 Contributions and PRs are welcome.
+
+## 📝 Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## 🤝 Contributing
 
