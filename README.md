@@ -15,7 +15,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Linux-blue)](#requirements)
 [![Made with Tor](https://img.shields.io/badge/powered%20by-Tor-7D4698?logo=torproject&logoColor=white)](https://www.torproject.org/)
-[![Changelog](https://img.shields.io/badge/changelog-v1.6.1-blue.svg)](CHANGELOG.md)
+[![Changelog](https://img.shields.io/github/v/release/amgpulse/torsystem?label=changelog&sort=semver&color=blue)](CHANGELOG.md)
 
 </div>
 
