@@ -113,7 +113,7 @@ Picking a country updates `torrc` (`ExitNodes {XX}` + `StrictNodes 1`), restarts
 3. `iptables` then redirects all outgoing DNS to `DNSPort` and all new TCP connections to `TransPort`.
 4. Local/private networks (loopback, LAN ranges) are exempted so your local network keeps working.
 5. A final `DROP` rule blocks anything that didn't match a Tor rule — this is what prevents leaks.
-6. The enabled `torsystem-killswitch.service` reapplies these rules before networking on boot whenever routing was active. Existing connections are not exempted, so they cannot continue outside Tor.
+6. The enabled `torsystem-killswitch.service` reapplies these rules before networking on boot whenever routing was active. Existing connections are not exempted, so they cannot continue outside Tor. If the full rule set cannot be restored, it falls back to a fail-closed `DROP` (loopback only) instead of letting traffic leak; run `stop` to recover.
 7. `stop` removes torsystem's firewall rules and explicitly unlocks normal networking. Private/LAN IPv4 ranges remain exempt while routing is active.
 
 ## ⚠️ Limitations

@@ -289,10 +289,15 @@ wait_for_tor_bootstrap() {
 # wait_for_ports_listening — make sure TransPort/DNSPort are actually up
 # before we redirect all system traffic into them.
 wait_for_ports_listening() {
-    local retries=10
+    local retries=10 tcp_listeners udp_listeners
     while (( retries > 0 )); do
-        if ss -tln 2>/dev/null | grep -q ":${TRANS_PORT} " \
-           && ss -uln 2>/dev/null | grep -q ":${DNS_PORT} "; then
+        # Capture first instead of piping into 'grep -q': with 'pipefail', an
+        # early grep exit can make the producer die of SIGPIPE (141) and turn
+        # a successful match into a false negative.
+        tcp_listeners="$(ss -tln 2>/dev/null || true)"
+        udp_listeners="$(ss -uln 2>/dev/null || true)"
+        if grep -q ":${TRANS_PORT} " <<<"$tcp_listeners" &&
+           grep -q ":${DNS_PORT} " <<<"$udp_listeners"; then
             return 0
         fi
         sleep 1
@@ -474,6 +479,19 @@ apply_iptables_rules() {
         iptables -t nat -I OUTPUT 1 -j "$NAT_CHAIN" || return 1
 }
 
+# apply_fail_closed_rules — last-resort IPv4 kill switch.
+# Used when the full rule set cannot be restored: block all outbound IPv4
+# except loopback instead of letting traffic escape outside Tor. It reuses the
+# torsystem chain, so a later 'stop' still tears it down normally.
+apply_fail_closed_rules() {
+    iptables -N "$IPTABLES_CHAIN" 2>/dev/null || true
+    iptables -F "$IPTABLES_CHAIN" || return 1
+    iptables -A "$IPTABLES_CHAIN" -o lo -j ACCEPT || return 1
+    iptables -A "$IPTABLES_CHAIN" -j DROP || return 1
+    iptables -C OUTPUT -j "$IPTABLES_CHAIN" 2>/dev/null ||
+        iptables -I OUTPUT 1 -j "$IPTABLES_CHAIN" || return 1
+}
+
 remove_iptables_rules() {
     local failed=0
     local chain table
@@ -579,10 +597,24 @@ cmd_boot_lock() {
             die "Could not clear stale torsystem IPv6 rules while restoring the boot kill switch."
     fi
 
-    block_ipv6_leaks ||
-        die "Could not restore IPv6 protection; the boot kill switch was not fully applied."
-    apply_iptables_rules ||
+    # Restore IPv6 protection first, but never let its failure skip the IPv4
+    # rules — an unapplied IPv4 kill switch is a real leak at boot.
+    local ipv6_ok=1
+    if ! block_ipv6_leaks; then
+        ipv6_ok=0
+        warn "Could not restore IPv6 protection; applying IPv4 fail-closed rules anyway."
+    fi
+
+    if ! apply_iptables_rules; then
+        if apply_fail_closed_rules; then
+            die "Could not restore the full IPv4 rule set; a fail-closed DROP rule was applied instead. Run 'stop' to recover."
+        fi
         die "Could not restore IPv4 protection; the boot kill switch was not fully applied."
+    fi
+
+    if (( ipv6_ok == 0 )); then
+        die "IPv6 protection could not be restored; IPv4 traffic is still fail-closed."
+    fi
 }
 
 # ---------- Stop ----------
@@ -612,11 +644,15 @@ cmd_stop() {
             [[ ! -f "$IP6TABLES_SAVE_PATH" ]]; then
             die "Legacy IPv6 firewall backup is missing; refusing to mark routing inactive."
         fi
+        # NB: do not put '< file' on the spinner_run call. spinner_run runs
+        # the command in the background, and non-interactive bash gives
+        # background jobs /dev/null on stdin, so the restore would silently
+        # read nothing. Redirect inside the wrapper instead.
         spinner_run "Restoring previous IPv4 firewall rules" -- \
-            iptables-restore < "$IPTABLES_SAVE_PATH"
+            bash -c 'iptables-restore < "$1"' _ "$IPTABLES_SAVE_PATH"
         if command -v ip6tables-restore >/dev/null 2>&1; then
             spinner_run "Restoring previous IPv6 firewall rules" -- \
-                ip6tables-restore < "$IP6TABLES_SAVE_PATH"
+                bash -c 'ip6tables-restore < "$1"' _ "$IP6TABLES_SAVE_PATH"
         fi
     fi
 
@@ -686,8 +722,19 @@ PY
 cmd_status() {
     [[ "${1:-}" == "--no-banner" ]] || print_banner
 
-    if is_active; then
-        echo -e "  Status: ${C_GREEN}${C_BOLD}ACTIVE${C_RESET} ✅"
+    # is_active verifies the firewall with 'iptables -C', which needs root.
+    # Without it we can still read the state file, but we must say that the
+    # firewall check was skipped instead of falsely reporting INACTIVE.
+    local state=""
+    [[ -f "$STATE_FILE" ]] && state="$(cat "$STATE_FILE")"
+    if [[ $EUID -eq 0 ]]; then
+        if is_active; then
+            echo -e "  Status: ${C_GREEN}${C_BOLD}ACTIVE${C_RESET} ✅"
+        else
+            echo -e "  Status: ${C_GRAY}${C_BOLD}INACTIVE${C_RESET} ⭕"
+        fi
+    elif [[ "$state" == "active" ]]; then
+        echo -e "  Status: ${C_YELLOW}${C_BOLD}ACTIVE${C_RESET} (unverified — run with sudo to confirm firewall rules) ✅"
     else
         echo -e "  Status: ${C_GRAY}${C_BOLD}INACTIVE${C_RESET} ⭕"
     fi
