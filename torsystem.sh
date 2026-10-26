@@ -15,7 +15,7 @@
 #
 set -euo pipefail
 
-VERSION="1.6.1"
+VERSION="1.7.0" 
 
 # ---------- Colors & style ----------
 if [[ -t 1 ]]; then
