@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-26
+
+### Added
+
+- Native `nftables` support with dual-backend auto-detection, prioritizing `nftables` and falling back to legacy `iptables`.
+- Dedicated `inet torsystem` table providing unified IPv4 and IPv6 leak protection, fail-closed kill switch, and clean atomic rule teardown.
+- Persistent boot kill switch support for `nftables` via `torsystem-killswitch.service`.
+- Manual firewall backend override via `TORSYSTEM_BACKEND` environment variable (`nftables` or `iptables`).
+
+### Changed
+
+- `status` and `check` commands now detect and display the active firewall backend, providing tailored diagnostics (`nft` or `iptables`).
+- Prerequisites installation now includes `nftables` across `pacman`, `apt`, and `dnf`.
+- Updated documentation and removed requirement for Arch Linux users to disable `nftables.service`.
+
 ## [1.6.1] - 2026-10-22
 
 ### Fixed
@@ -103,7 +118,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `iptables`, with `install`, `start`, `stop`, `restart`, `status` and `check`
   commands, multi-distro package detection, and a built-in leak check.
 
-[Unreleased]: https://github.com/amgpulse/torsystem/compare/v1.6.1...HEAD
+[Unreleased]: https://github.com/amgpulse/torsystem/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/amgpulse/torsystem/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/amgpulse/torsystem/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/amgpulse/torsystem/compare/v1.5.1...v1.6.0
 [1.5.1]: https://github.com/amgpulse/torsystem/compare/v1.4.0...v1.5.1
