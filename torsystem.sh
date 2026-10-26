@@ -55,12 +55,14 @@ KILLSWITCH_SCRIPT_PATH="/usr/local/sbin/torsystem.sh"
 KILLSWITCH_SERVICE_PATH="/etc/systemd/system/torsystem-killswitch.service"
 IPTABLES_SAVE_PATH="/var/lib/torsystem/iptables.rules.bak"
 IP6TABLES_SAVE_PATH="/var/lib/torsystem/ip6tables.rules.bak"
+NFTABLES_SAVE_PATH="/var/lib/torsystem/nftables.rules.bak"
 STATE_DIR="/var/lib/torsystem"
 STATE_FILE="$STATE_DIR/state"
 BACKEND_FILE="$STATE_DIR/firewall-backend"
 IPTABLES_CHAIN="TORSYSTEM_OUT"
 NAT_CHAIN="TORSYSTEM_NAT"
 IP6TABLES_CHAIN="TORSYSTEM6_OUT"
+NFTABLES_TABLE="torsystem"
 
 # ---------- Banner ----------
 print_banner() {
@@ -107,10 +109,32 @@ ensure_state_dir() {
     mkdir -p "$STATE_DIR"
 }
 
+detect_firewall_backend() {
+    if [[ -n "${TORSYSTEM_BACKEND:-}" ]]; then
+        case "$TORSYSTEM_BACKEND" in
+            nft|nftables) echo "nftables"; return 0 ;;
+            iptables|chains) echo "chains"; return 0 ;;
+            *) die "Unsupported TORSYSTEM_BACKEND: $TORSYSTEM_BACKEND (expected 'nftables' or 'iptables')." ;;
+        esac
+    fi
+
+    if command -v nft >/dev/null 2>&1; then
+        echo "nftables"
+    elif command -v iptables >/dev/null 2>&1; then
+        echo "chains"
+    else
+        die "Neither nftables (nft) nor iptables was found on this system."
+    fi
+}
+
 is_active() {
     [[ -f "$STATE_FILE" ]] &&
         [[ "$(cat "$STATE_FILE")" == "active" ]] || return 1
-    if [[ -f "$BACKEND_FILE" ]] && [[ "$(cat "$BACKEND_FILE")" == "chains" ]]; then
+    if [[ -f "$BACKEND_FILE" ]] && [[ "$(cat "$BACKEND_FILE")" == "nftables" ]]; then
+        command -v nft >/dev/null 2>&1 || return 1
+        nft list table inet "$NFTABLES_TABLE" >/dev/null 2>&1 || return 1
+        return 0
+    elif [[ -f "$BACKEND_FILE" ]] && [[ "$(cat "$BACKEND_FILE")" == "chains" ]]; then
         command -v iptables >/dev/null 2>&1 || return 1
         command -v ip6tables >/dev/null 2>&1 || return 1
         iptables -C OUTPUT -j "$IPTABLES_CHAIN" >/dev/null 2>&1 || return 1
@@ -344,14 +368,14 @@ cmd_install() {
     case "$pm" in
         pacman)
             spinner_run "Syncing package databases" -- pacman -Sy --noconfirm
-        spinner_run "Installing tor, iptables, curl, iproute2, python" -- pacman -S --noconfirm --needed tor iptables curl iproute2 python
+            spinner_run "Installing tor, nftables, iptables, curl, iproute2, python" -- pacman -S --noconfirm --needed tor nftables iptables curl iproute2 python
             ;;
         apt)
             spinner_run "Updating package lists" -- apt-get update -qq
-        spinner_run "Installing tor, iptables, curl, iproute2, python3" -- apt-get install -y tor iptables curl iproute2 python3
+            spinner_run "Installing tor, nftables, iptables, curl, iproute2, python3" -- apt-get install -y tor nftables iptables curl iproute2 python3
             ;;
         dnf)
-        spinner_run "Installing tor, iptables, curl, iproute, python3" -- dnf install -y tor iptables curl iproute python3
+            spinner_run "Installing tor, nftables, iptables, curl, iproute, python3" -- dnf install -y tor nftables iptables curl iproute python3
             ;;
     esac
 
@@ -428,6 +452,80 @@ restore_ipv6() {
         ip6tables -F "$IP6TABLES_CHAIN" || return 1
         ip6tables -X "$IP6TABLES_CHAIN" || return 1
     fi
+}
+
+save_nftables_snapshot() {
+    local nft_tmp
+    nft_tmp="$(mktemp "$STATE_DIR/nftables.XXXXXX")" || return 1
+    if ! nft list ruleset > "$nft_tmp" 2>/dev/null; then
+        rm -f "$nft_tmp"
+        return 1
+    fi
+    if ! mv -f "$nft_tmp" "$NFTABLES_SAVE_PATH"; then
+        rm -f "$nft_tmp"
+        return 1
+    fi
+    chmod 600 "$NFTABLES_SAVE_PATH"
+}
+
+apply_nftables_rules() {
+    local elements_str
+    elements_str=$(IFS=, ; echo "${NON_TOR_NETS[*]}")
+
+    local tor_uid_nat=""
+    local tor_uid_filter=""
+    if [[ -n "$TOR_UID" ]]; then
+        tor_uid_nat="meta skuid $TOR_UID return"
+        tor_uid_filter="meta skuid $TOR_UID accept"
+    fi
+
+    remove_nftables_rules || true
+
+    nft -f - <<EOF || return 1
+table inet $NFTABLES_TABLE {
+    set non_tor_nets {
+        type ipv4_addr
+        flags interval
+        elements = { ${elements_str} }
+    }
+
+    chain nat_output {
+        type nat hook output priority -100; policy accept;
+        ${tor_uid_nat}
+        udp dport 53 redirect to :$DNS_PORT
+        tcp dport 53 redirect to :$DNS_PORT
+        ip daddr @non_tor_nets return
+        tcp flags & (fin | syn | rst | ack) == syn redirect to :$TRANS_PORT
+    }
+
+    chain filter_output {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        meta nfproto ipv6 drop
+        ${tor_uid_filter}
+        ip daddr @non_tor_nets accept
+    }
+}
+EOF
+}
+
+apply_fail_closed_nftables_rules() {
+    remove_nftables_rules || true
+    nft -f - <<EOF || return 1
+table inet $NFTABLES_TABLE {
+    chain filter_output {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+    }
+}
+EOF
+}
+
+remove_nftables_rules() {
+    if nft list table inet "$NFTABLES_TABLE" >/dev/null 2>&1; then
+        nft delete table inet "$NFTABLES_TABLE" || return 1
+    fi
+    return 0
 }
 
 save_firewall_snapshots() {
@@ -515,30 +613,51 @@ remove_iptables_rules() {
 # ---------- Start ----------
 cmd_start() {
     require_root
-    require_cmds tor iptables iptables-save ip6tables ip6tables-save curl ss systemctl python3
+    local backend
+    backend="$(detect_firewall_backend)"
+
+    if [[ "$backend" == "nftables" ]]; then
+        require_cmds tor nft curl ss systemctl python3
+    else
+        require_cmds tor iptables iptables-save ip6tables ip6tables-save curl ss systemctl python3
+    fi
     require_tor_uid
     print_banner
 
     if is_active; then
-        if [[ ! -f "$BACKEND_FILE" ]] || [[ "$(cat "$BACKEND_FILE")" != "chains" ]]; then
+        local current_backend=""
+        [[ -f "$BACKEND_FILE" ]] && current_backend="$(cat "$BACKEND_FILE")"
+        if [[ "$current_backend" != "chains" && "$current_backend" != "nftables" ]]; then
             die "Legacy Tor routing is marked active. Run 'stop' to restore its saved firewall rules before starting again."
         fi
-        warn "Already active. Use '${C_CYAN}restart${C_RESET}' to change identity."
+        warn "Already active (backend: $current_backend). Use '${C_CYAN}restart${C_RESET}' to change identity."
         return 0
     fi
 
     ensure_state_dir
-    if [[ -f "$BACKEND_FILE" ]] && [[ "$(cat "$BACKEND_FILE")" == "chains" ]]; then
-        remove_iptables_rules || die "Could not remove stale torsystem IPv4 chains; run 'stop' before retrying."
-        restore_ipv6 || die "Could not remove stale torsystem IPv6 rules; run 'stop' before retrying."
-    else
-        if iptables -t nat -S "$NAT_CHAIN" >/dev/null 2>&1 ||
-            iptables -S "$IPTABLES_CHAIN" >/dev/null 2>&1; then
-            die "A reserved torsystem firewall chain already exists without an ownership marker; refusing to modify it."
+    if [[ -f "$BACKEND_FILE" ]]; then
+        local stale_backend
+        stale_backend="$(cat "$BACKEND_FILE")"
+        if [[ "$stale_backend" == "nftables" ]]; then
+            remove_nftables_rules || die "Could not remove stale torsystem nftables table; run 'stop' before retrying."
+        elif [[ "$stale_backend" == "chains" ]]; then
+            remove_iptables_rules || die "Could not remove stale torsystem IPv4 chains; run 'stop' before retrying."
+            restore_ipv6 || die "Could not remove stale torsystem IPv6 rules; run 'stop' before retrying."
         fi
-        if command -v ip6tables >/dev/null 2>&1 &&
-            ip6tables -S "$IP6TABLES_CHAIN" >/dev/null 2>&1; then
-            die "A reserved torsystem IPv6 chain already exists without an ownership marker; refusing to modify it."
+    else
+        if [[ "$backend" == "nftables" ]]; then
+            if nft list table inet "$NFTABLES_TABLE" >/dev/null 2>&1; then
+                die "A reserved torsystem nftables table already exists without an ownership marker; refusing to modify it."
+            fi
+        else
+            if iptables -t nat -S "$NAT_CHAIN" >/dev/null 2>&1 ||
+                iptables -S "$IPTABLES_CHAIN" >/dev/null 2>&1; then
+                die "A reserved torsystem firewall chain already exists without an ownership marker; refusing to modify it."
+            fi
+            if command -v ip6tables >/dev/null 2>&1 &&
+                ip6tables -S "$IP6TABLES_CHAIN" >/dev/null 2>&1; then
+                die "A reserved torsystem IPv6 chain already exists without an ownership marker; refusing to modify it."
+            fi
         fi
     fi
 
@@ -546,24 +665,41 @@ cmd_start() {
     wait_for_tor_bootstrap 180 || die "Tor did not finish bootstrapping; routing was not enabled."
     wait_for_ports_listening || die "Tor's transparent proxy ports are not listening; routing was not enabled."
 
-    save_firewall_snapshots ||
-        die "Could not save the current IPv4/IPv6 firewall snapshots; routing was not enabled."
-    printf '%s\n' "chains" > "$BACKEND_FILE"
-    printf '%s\n' "starting" > "$STATE_FILE"
-    if ! block_ipv6_leaks || ! apply_iptables_rules; then
-        warn "Firewall setup failed; removing torsystem-owned rules."
-        if remove_iptables_rules && restore_ipv6; then
-            printf '%s\n' "inactive" > "$STATE_FILE"
-            rm -f "$BACKEND_FILE"
-        else
-            warn "Cleanup was incomplete; run 'stop' to remove remaining torsystem rules."
+    if [[ "$backend" == "nftables" ]]; then
+        save_nftables_snapshot ||
+            die "Could not save the current nftables ruleset snapshot; routing was not enabled."
+        printf '%s\n' "nftables" > "$BACKEND_FILE"
+        printf '%s\n' "starting" > "$STATE_FILE"
+        if ! apply_nftables_rules; then
+            warn "Firewall setup failed; removing torsystem-owned rules."
+            if remove_nftables_rules; then
+                printf '%s\n' "inactive" > "$STATE_FILE"
+                rm -f "$BACKEND_FILE"
+            else
+                warn "Cleanup was incomplete; run 'stop' to remove remaining torsystem rules."
+            fi
+            die "Tor routing was not enabled because nftables firewall setup failed."
         fi
-        die "Tor routing was not enabled because firewall setup failed."
+    else
+        save_firewall_snapshots ||
+            die "Could not save the current IPv4/IPv6 firewall snapshots; routing was not enabled."
+        printf '%s\n' "chains" > "$BACKEND_FILE"
+        printf '%s\n' "starting" > "$STATE_FILE"
+        if ! block_ipv6_leaks || ! apply_iptables_rules; then
+            warn "Firewall setup failed; removing torsystem-owned rules."
+            if remove_iptables_rules && restore_ipv6; then
+                printf '%s\n' "inactive" > "$STATE_FILE"
+                rm -f "$BACKEND_FILE"
+            else
+                warn "Cleanup was incomplete; run 'stop' to remove remaining torsystem rules."
+            fi
+            die "Tor routing was not enabled because firewall setup failed."
+        fi
     fi
 
     echo "active" > "$STATE_FILE"
     echo ""
-    ok "${C_BOLD}${C_GREEN}Tor routing is now ACTIVE.${C_RESET} External IPv4 TCP and DNS go through Tor; private networks are exempt and other UDP is blocked."
+    ok "${C_BOLD}${C_GREEN}Tor routing is now ACTIVE (${backend}).${C_RESET} External IPv4 TCP and DNS go through Tor; private networks are exempt and other UDP is blocked."
     echo ""
     cmd_status --no-banner
 }
@@ -575,18 +711,30 @@ cmd_boot_lock() {
     local current_state="" backend=""
     [[ -f "$STATE_FILE" ]] && current_state="$(cat "$STATE_FILE")"
     [[ -f "$BACKEND_FILE" ]] && backend="$(cat "$BACKEND_FILE")"
-    if [[ "$backend" != "chains" ]] ||
+    if [[ "$backend" != "chains" && "$backend" != "nftables" ]] ||
         { [[ "$current_state" != "active" ]] && [[ "$current_state" != "starting" ]]; }; then
         return 0
     fi
 
-    require_cmds iptables ip6tables
     if ! TOR_UID="$(detect_tor_uid)"; then
         TOR_UID=""
-        warn "Tor service account is missing; boot protection will block external IPv4 traffic."
+        warn "Tor service account is missing; boot protection will block external traffic."
     fi
     ensure_state_dir
 
+    if [[ "$backend" == "nftables" ]]; then
+        require_cmds nft
+        remove_nftables_rules || true
+        if ! apply_nftables_rules; then
+            if apply_fail_closed_nftables_rules; then
+                die "Could not restore the full nftables rule set; a fail-closed DROP rule was applied instead. Run 'stop' to recover."
+            fi
+            die "Could not restore firewall protection; the boot kill switch was not fully applied."
+        fi
+        return 0
+    fi
+
+    require_cmds iptables ip6tables
     if iptables -t nat -S "$NAT_CHAIN" >/dev/null 2>&1 ||
         iptables -S "$IPTABLES_CHAIN" >/dev/null 2>&1; then
         remove_iptables_rules ||
@@ -623,15 +771,21 @@ cmd_stop() {
     print_banner
     ensure_state_dir
 
-    local current_state=""
+    local current_state="" backend=""
     [[ -f "$STATE_FILE" ]] && current_state="$(cat "$STATE_FILE")"
+    [[ -f "$BACKEND_FILE" ]] && backend="$(cat "$BACKEND_FILE")"
+
     if [[ "$current_state" != "active" ]] &&
-        { [[ ! -f "$BACKEND_FILE" ]] || [[ "$(cat "$BACKEND_FILE")" != "chains" ]]; }; then
+        { [[ ! -f "$BACKEND_FILE" ]] || { [[ "$backend" != "chains" ]] && [[ "$backend" != "nftables" ]]; }; }; then
         log "Tor routing is not marked active; leaving firewall rules unchanged."
         return 0
     fi
 
-    if [[ -f "$BACKEND_FILE" ]] && [[ "$(cat "$BACKEND_FILE")" == "chains" ]]; then
+    if [[ "$backend" == "nftables" ]]; then
+        if ! remove_nftables_rules; then
+            die "Could not remove torsystem nftables table; state was retained for recovery."
+        fi
+    elif [[ "$backend" == "chains" ]]; then
         if ! remove_iptables_rules || ! restore_ipv6; then
             die "Could not remove all torsystem firewall rules; state was retained for recovery."
         fi
@@ -722,19 +876,20 @@ PY
 cmd_status() {
     [[ "${1:-}" == "--no-banner" ]] || print_banner
 
-    # is_active verifies the firewall with 'iptables -C', which needs root.
+    # is_active verifies the firewall with 'nft list table' or 'iptables -C', which needs root.
     # Without it we can still read the state file, but we must say that the
     # firewall check was skipped instead of falsely reporting INACTIVE.
-    local state=""
+    local state="" backend=""
     [[ -f "$STATE_FILE" ]] && state="$(cat "$STATE_FILE")"
+    [[ -f "$BACKEND_FILE" ]] && backend="$(cat "$BACKEND_FILE")"
     if [[ $EUID -eq 0 ]]; then
         if is_active; then
-            echo -e "  Status: ${C_GREEN}${C_BOLD}ACTIVE${C_RESET} ✅"
+            echo -e "  Status: ${C_GREEN}${C_BOLD}ACTIVE${C_RESET} (${backend:-unknown}) ✅"
         else
             echo -e "  Status: ${C_GRAY}${C_BOLD}INACTIVE${C_RESET} ⭕"
         fi
     elif [[ "$state" == "active" ]]; then
-        echo -e "  Status: ${C_YELLOW}${C_BOLD}ACTIVE${C_RESET} (unverified — run with sudo to confirm firewall rules) ✅"
+        echo -e "  Status: ${C_YELLOW}${C_BOLD}ACTIVE${C_RESET} (${backend:-unknown}, unverified — run with sudo to confirm firewall rules) ✅"
     else
         echo -e "  Status: ${C_GRAY}${C_BOLD}INACTIVE${C_RESET} ⭕"
     fi
@@ -813,13 +968,20 @@ cmd_check() {
     else
         curl_status=$?
     fi
+    local fw_diag="sudo iptables -t nat -L -n -v"
+    local cur_backend=""
+    [[ -f "$BACKEND_FILE" ]] && cur_backend="$(cat "$BACKEND_FILE")"
+    if [[ "$cur_backend" == "nftables" ]]; then
+        fw_diag="sudo nft list table inet $NFTABLES_TABLE"
+    fi
+
     if [[ $curl_status -ne 0 || -z "$resp" ]]; then
         _tor_check_diagnose "$curl_status"
         echo ""
         warn "Further diagnostics:"
         echo -e "    ${C_DIM}journalctl -u tor -n 50${C_RESET}          (Tor bootstrap / errors)"
         echo -e "    ${C_DIM}ss -tlnp | grep -E '9040|5353'${C_RESET}   (TransPort / DNSPort listening?)"
-        echo -e "    ${C_DIM}sudo iptables -t nat -L -n -v${C_RESET}    (rules actually applied?)"
+        echo -e "    ${C_DIM}${fw_diag}${C_RESET}    (rules actually applied?)"
         return 1
     fi
     echo -e "  ${C_DIM}$resp${C_RESET}"
@@ -836,7 +998,7 @@ cmd_check() {
         warn "Diagnostics to check:"
         echo -e "    ${C_DIM}journalctl -u tor -n 50${C_RESET}          (Tor bootstrap / errors)"
         echo -e "    ${C_DIM}ss -tlnp | grep -E '9040|5353'${C_RESET}   (TransPort / DNSPort listening?)"
-        echo -e "    ${C_DIM}sudo iptables -t nat -L -n -v${C_RESET}    (rules actually applied?)"
+        echo -e "    ${C_DIM}${fw_diag}${C_RESET}    (rules actually applied?)"
         return 1
     fi
     return 0

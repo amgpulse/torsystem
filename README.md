@@ -26,7 +26,7 @@
 
 ## ✨ Features
 
-- 🧅 **System-wide routing** — all TCP + DNS traffic transparently redirected through Tor via `iptables`
+- 🧅 **System-wide routing** — all TCP + DNS traffic transparently redirected through Tor via `nftables` or `iptables`
 - 🛡️ **Leak-proof by default** — a final `DROP` rule blocks anything that isn't routed through Tor instead of silently leaking it, and all IPv6 traffic is blocked outright (Tor only carries IPv4 here)
 - 🔒 **Persistent kill switch** — the firewall is restored before networking on boot and stays fail-closed if Tor stops; only `stop` removes it
 - ⏳ **Bootstrap-aware** — checks Tor's authenticated ControlPort for bootstrap progress, with `journalctl` as a fallback, before enabling routing
@@ -43,10 +43,7 @@
 - Linux with `sudo` and `systemd`
 - One of: `pacman` (Arch), `apt` (Debian/Ubuntu/Kali/Parrot), `dnf` (Fedora)
 
-> **Arch users:** if `nftables.service` is active and conflicts with the legacy `iptables` rules this script uses, stop it first:
-> ```bash
-> sudo systemctl stop nftables.service
-> ```
+> **Firewall compatibility:** `torsystem` natively supports both modern `nftables` and legacy `iptables`. When `nft` is present, it creates an isolated `inet torsystem` table that works cleanly alongside existing firewall setups (including `nftables.service` on Arch/Fedora) without conflicts.
 
 ## 🚀 Installation
 
@@ -57,7 +54,7 @@ chmod +x torsystem.sh
 sudo ./torsystem.sh install
 ```
 
-This installs `tor`, `iptables`, `curl`, and `iproute2`, and appends the required config to `/etc/tor/torrc` (your original `torrc` is backed up first, automatically).
+This installs `tor`, `nftables`, `iptables`, `curl`, and `iproute2`, and appends the required config to `/etc/tor/torrc` (your original `torrc` is backed up first, automatically).
 It also installs `torsystem` under `/usr/local/sbin` and enables a systemd unit that restores the kill switch before the network starts. Re-run `install` after replacing the script to update that boot-time copy.
 
 ## 🕹️ Usage
