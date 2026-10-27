@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.1] - 2026-10-28
+
+### Fixed
+
+- Resolved conflicting intervals error in `nftables` by removing `VIRT_NET` (`10.192.0.0/10`) from `non_tor_nets` (as it is a subset of `10.0.0.0/8`).
+- Added explicit TCP redirection for `VIRT_NET` before non-Tor network exemptions, ensuring `.onion` addresses route properly through Tor.
+
 ## [1.7.0] - 2026-10-26
 
 ### Added
@@ -118,7 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `iptables`, with `install`, `start`, `stop`, `restart`, `status` and `check`
   commands, multi-distro package detection, and a built-in leak check.
 
-[Unreleased]: https://github.com/amgpulse/torsystem/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/amgpulse/torsystem/compare/v1.7.1...HEAD
+[1.7.1]: https://github.com/amgpulse/torsystem/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/amgpulse/torsystem/compare/v1.6.1...v1.7.0
 [1.6.1]: https://github.com/amgpulse/torsystem/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/amgpulse/torsystem/compare/v1.5.1...v1.6.0
