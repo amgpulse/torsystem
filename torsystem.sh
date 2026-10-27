@@ -47,7 +47,7 @@ TRANS_PORT=9040
 DNS_PORT=5353
 TOR_CONTROL_PORT=9051
 VIRT_NET="10.192.0.0/10"
-NON_TOR_NETS=("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "$VIRT_NET")
+NON_TOR_NETS=("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16")
 
 TORRC_PATH="/etc/tor/torrc"
 TORRC_BACKUP="/etc/tor/torrc.torsystem.bak"
@@ -494,6 +494,7 @@ table inet $NFTABLES_TABLE {
         ${tor_uid_nat}
         udp dport 53 redirect to :$DNS_PORT
         tcp dport 53 redirect to :$DNS_PORT
+        ip daddr $VIRT_NET tcp flags & (fin | syn | rst | ack) == syn redirect to :$TRANS_PORT
         ip daddr @non_tor_nets return
         tcp flags & (fin | syn | rst | ack) == syn redirect to :$TRANS_PORT
     }
@@ -567,11 +568,12 @@ apply_iptables_rules() {
     if [[ -n "$TOR_UID" ]]; then
         iptables -t nat -A "$NAT_CHAIN" -m owner --uid-owner "$TOR_UID" -j RETURN || return 1
     fi
+    iptables -t nat -A "$NAT_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    iptables -t nat -A "$NAT_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    iptables -t nat -A "$NAT_CHAIN" -p tcp -d "$VIRT_NET" --syn -j REDIRECT --to-ports "$TRANS_PORT" || return 1
     for net in "${NON_TOR_NETS[@]}"; do
         iptables -t nat -A "$NAT_CHAIN" -d "$net" -j RETURN || return 1
     done
-    iptables -t nat -A "$NAT_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
-    iptables -t nat -A "$NAT_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports "$DNS_PORT" || return 1
     iptables -t nat -A "$NAT_CHAIN" -p tcp --syn -j REDIRECT --to-ports "$TRANS_PORT" || return 1
     iptables -t nat -C OUTPUT -j "$NAT_CHAIN" 2>/dev/null ||
         iptables -t nat -I OUTPUT 1 -j "$NAT_CHAIN" || return 1
