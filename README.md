@@ -42,6 +42,7 @@
 
 - Linux with `sudo` and `systemd`
 - One of: `pacman` (Arch), `apt` (Debian/Ubuntu/Kali/Parrot), `dnf` (Fedora)
+- `python3` (used for Tor ControlPort communication)
 
 > **Firewall compatibility:** `torsystem` natively supports both modern `nftables` and legacy `iptables`. When `nft` is present, it creates an isolated `inet torsystem` table that works cleanly alongside existing firewall setups (including `nftables.service` on Arch/Fedora) without conflicts.
 
@@ -54,7 +55,7 @@ chmod +x torsystem.sh
 sudo ./torsystem.sh install
 ```
 
-This installs `tor`, `nftables`, `iptables`, `curl`, and `iproute2`, and appends the required config to `/etc/tor/torrc` (your original `torrc` is backed up first, automatically).
+This installs `tor`, `nftables`, `iptables`, `curl`, `iproute2`, and `python3`, and appends the required config to `/etc/tor/torrc` (your original `torrc` is backed up first, automatically). It also configures the local ControlPort at `127.0.0.1:9051` with cookie authentication.
 It also installs `torsystem` under `/usr/local/sbin` and enables a systemd unit that restores the kill switch before the network starts. Re-run `install` after replacing the script to update that boot-time copy.
 
 ## 🕹️ Usage
@@ -65,6 +66,8 @@ sudo ./torsystem.sh status    # show current status + exit IP
 sudo ./torsystem.sh check     # verify traffic is really exiting through Tor
 sudo ./torsystem.sh restart   # rotate to a new Tor identity / exit IP
 sudo ./torsystem.sh stop      # restore normal networking
+sudo ./torsystem.sh about     # show torsystem version
+sudo ./torsystem.sh update    # check for a newer version (does not install it)
 ```
 
 | Command   | Description                                              |
@@ -76,6 +79,8 @@ sudo ./torsystem.sh stop      # restore normal networking
 | `status`  | Show current status and exit IP                             |
 | `tui`     | Launch an interactive menu (whiptail/dialog)                 |
 | `check`   | Verify traffic is really passing through Tor                |
+| `about`   | Show the installed torsystem version                         |
+| `update`  | Check whether a newer version is available; does not install it |
 
 ## 🖥️ Interactive TUI (optional)
 
@@ -85,7 +90,7 @@ Prefer menus over remembering flags? Run the built-in terminal UI instead — no
 sudo ./torsystem.sh tui
 ```
 
-This launches a `whiptail`/`dialog`-based menu (works over SSH too, no GUI needed) with the same actions — Install, Start, Stop, Restart, Status, Check — presented as a simple list you navigate with arrow keys.
+This launches a `whiptail`/`dialog`-based menu (works over SSH too, no GUI needed) with six main actions — Install, Start, Stop, Restart, Status, Check — plus **Advanced settings** and **About / version**, presented as a simple list you navigate with arrow keys.
 
 > Requires `whiptail` (preinstalled on most Debian/Ubuntu systems) or `dialog` (Arch/Fedora):
 > ```bash
@@ -107,10 +112,10 @@ Picking a country updates `torrc` (`ExitNodes {XX}` + `StrictNodes 1`), restarts
 ## ⚙️ How it works
 
 1. `torrc` is configured with a `TransPort` (TCP) and `DNSPort` (DNS).
-2. On `start`, the script waits for Tor to report `Bootstrapped 100%` and confirms `TransPort`/`DNSPort` are listening — *before* touching `iptables`.
-3. `iptables` then redirects all outgoing DNS to `DNSPort` and all new TCP connections to `TransPort`.
-4. Local/private networks (loopback, LAN ranges) are exempted so your local network keeps working.
-5. A final `DROP` rule blocks anything that didn't match a Tor rule — this is what prevents leaks.
+2. On `start`, the script waits for Tor to report `Bootstrapped 100%` and confirms `TransPort`/`DNSPort` are listening — *before* touching the firewall.
+3. By default, `nftables` is used when available, with an isolated `inet torsystem` table. Otherwise, `iptables` is used with `TORSYSTEM_*` chains. Set `TORSYSTEM_BACKEND` to override the backend.
+4. Local/private networks (loopback, LAN ranges) are exempted so your local network keeps working. DNS is always redirected to Tor, even when the configured resolver is on the local network.
+5. A final `DROP` rule blocks traffic that did not match a Tor rule. Traffic owned by the `tor` user is exempt so Tor can make its outbound connections (including to bridges).
 6. The enabled `torsystem-killswitch.service` reapplies these rules before networking on boot whenever routing was active. Existing connections are not exempted, so they cannot continue outside Tor. If the full rule set cannot be restored, it falls back to a fail-closed `DROP` (loopback only) instead of letting traffic leak; run `stop` to recover.
 7. `stop` removes torsystem's firewall rules and explicitly unlocks normal networking. Private/LAN IPv4 ranges remain exempt while routing is active.
 
@@ -121,11 +126,11 @@ Picking a country updates `torrc` (`ExitNodes {XX}` + `StrictNodes 1`), restarts
 - **UDP** (other than DNS) isn't routed — Tor only carries TCP. UDP-only apps (some games, VoIP) will be **blocked**, not leaked.
 - **IPv6 is blocked outright** while routing is active, since Tor only carries IPv4 traffic here. This is intentional and fail-safe: rather than risk an IPv6 leak, any IPv6 traffic is dropped. If an app absolutely needs IPv6, it won't work while routing is on — that's by design.
 - Tor is great for browsing, not for torrenting/streaming/heavy downloads — it's slower than a regular VPN, and misusing it burdens the whole Tor network.
-- Backups live in `/var/lib/torsystem` (`iptables` + `ip6tables`) and `/etc/tor/torrc.torsystem.bak` (original `torrc`).
+- Firewall snapshots for `iptables`, `ip6tables`, and `nftables` live in `/var/lib/torsystem`; they are only used to recover setups from older versions. `stop` removes only torsystem's own rules. The original `torrc` backup is at `/etc/tor/torrc.torsystem.bak`.
 
 ## 🧩 Roadmap / extending this
 
-All logic lives in isolated functions (`cmd_install`, `cmd_start`, `cmd_stop`, `cmd_restart`, `cmd_status`, `cmd_check`), so it's straightforward to:
+All logic lives in isolated functions (`cmd_install`, `cmd_start`, `cmd_stop`, `cmd_restart`, `cmd_status`, `cmd_check`, `cmd_boot_lock`, `cmd_update`, `cmd_tui`), so it's straightforward to:
 - Wrap it in a GUI (Python/PyQt, GTK, etc.) via `subprocess` + `pkexec`
 - Add per-app exclusion rules
 - Add Tor bridge support for censored networks
