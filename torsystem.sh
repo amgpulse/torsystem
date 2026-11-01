@@ -9,6 +9,7 @@
 #   sudo ./torsystem.sh restart     Request a new Tor identity (new exit IP)
 #   sudo ./torsystem.sh status      Show current status and exit IP
 #   sudo ./torsystem.sh check       Test for DNS/IP leaks
+#   sudo ./torsystem.sh exit-node <CC|any>  Set or clear the exit country
 #   ./torsystem.sh about            Show torsystem version
 #   ./torsystem.sh update           Check for a newer release (does not install)
 #   After install, the kill switch is restored before networking on boot.
@@ -1042,6 +1043,22 @@ EOF
     cmd_status --no-banner
 }
 
+cmd_exit_node() {
+    if (( $# != 1 )); then
+        die "Usage: sudo $0 exit-node <CC|any> (e.g. 'exit-node DE' or 'exit-node any')."
+    fi
+
+    local country code=""
+    country="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$country" != "any" ]]; then
+        code="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+        [[ "$code" =~ ^[A-Z]{2}$ ]] ||
+            die "Exit country must be a two-letter country code (e.g. DE), or 'any' to clear the restriction."
+    fi
+
+    set_torrc_exit_node "$code"
+}
+
 # ---------- TUI (interactive menu) ----------
 # Runs a cmd_* function in a subshell so an internal 'exit' (e.g. from die())
 # only ends that subshell, not the whole TUI session; output is captured to
@@ -1281,6 +1298,7 @@ usage() {
     ${C_CYAN}restart${C_RESET}     Request a new Tor identity
     ${C_CYAN}status${C_RESET}      Show current status and exit IP
     ${C_CYAN}check${C_RESET}       Verify traffic is really passing through Tor
+    ${C_CYAN}exit-node${C_RESET}   Set preferred exit country (CC) or clear it with 'any'
     ${C_CYAN}about${C_RESET}       Show torsystem version
     ${C_CYAN}update${C_RESET}      Check for a newer release (does not install it)
     ${C_CYAN}tui${C_RESET}         Launch an interactive menu (whiptail/dialog)
@@ -1299,6 +1317,7 @@ main() {
         restart)  cmd_restart ;;
         status)   cmd_status ;;
         check)    cmd_check ;;
+        exit-node) shift; cmd_exit_node "$@" ;;
         about)    cmd_about ;;
         update)   cmd_update ;;
         tui)      cmd_tui ;;

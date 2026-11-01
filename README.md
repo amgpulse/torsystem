@@ -73,6 +73,8 @@ sudo ./torsystem.sh start     # enable system-wide routing through Tor
 sudo ./torsystem.sh status    # show current status + exit IP
 sudo ./torsystem.sh check     # verify traffic is really exiting through Tor
 sudo ./torsystem.sh restart   # rotate to a new Tor identity / exit IP
+sudo ./torsystem.sh exit-node DE   # prefer a German exit node
+sudo ./torsystem.sh exit-node any  # clear the country preference
 sudo ./torsystem.sh stop      # restore normal networking
 sudo ./torsystem.sh about     # show torsystem version
 sudo ./torsystem.sh update    # check for a newer version (does not install it)
@@ -84,6 +86,7 @@ sudo ./torsystem.sh update    # check for a newer version (does not install it)
 | `start`   | Enable transparent routing through Tor                     |
 | `stop`    | Restore normal networking                                   |
 | `restart` | Request a new Tor identity (new exit IP)                    |
+| `exit-node <CC\|any>` | Set a preferred exit country or clear the preference |
 | `status`  | Show current status and exit IP                             |
 | `tui`     | Launch an interactive menu (whiptail/dialog)                 |
 | `check`   | Verify traffic is really passing through Tor                |
@@ -109,7 +112,15 @@ This launches a `whiptail`/`dialog`-based menu (works over SSH too, no GUI neede
 
 ### Advanced Settings — exit node country
 
-From the TUI's main menu, choose **Advanced settings** to pick a preferred exit country:
+Set or clear a preferred exit country from the CLI:
+
+```bash
+sudo ./torsystem.sh exit-node DE   # prefer Germany
+sudo ./torsystem.sh exit-node JP   # country codes are case-insensitive
+sudo ./torsystem.sh exit-node any  # allow any exit country
+```
+
+The same setting is also available from the TUI's **Advanced settings** menu. You can choose:
 
 - Quick list: Germany, Netherlands, United States, United Kingdom, France, Sweden, Switzerland
 - **Custom code**: enter any 2-letter ISO country code (e.g. `JP`, `CA`)
