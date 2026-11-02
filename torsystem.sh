@@ -1044,8 +1044,12 @@ EOF
 }
 
 cmd_exit_node() {
+    if (( $# == 1 )) && [[ "$1" == "show" ]]; then
+        cmd_exit_node_show
+        return
+    fi
     if (( $# != 1 )); then
-        die "Usage: sudo $0 exit-node <CC|any> (e.g. 'exit-node DE' or 'exit-node any')."
+        die "Usage: sudo $0 exit-node <CC|any|show> (e.g. 'exit-node DE', 'exit-node any', or 'exit-node show')."
     fi
 
     local country code=""
@@ -1057,6 +1061,34 @@ cmd_exit_node() {
     fi
 
     set_torrc_exit_node "$code"
+}
+
+cmd_exit_node_show() {
+    [[ -r "$TORRC_PATH" ]] ||
+        die "Cannot read Tor configuration at $TORRC_PATH. Run 'install' first."
+
+    local code
+    code="$(sed -n \
+        '/^# torsystem-exit-node-begin$/,/^# torsystem-exit-node-end$/s/^ExitNodes {\([A-Z][A-Z]\)}$/\1/p' \
+        "$TORRC_PATH" | head -n 1)"
+
+    if [[ -z "$code" ]]; then
+        echo "Selected exit location: Any country (default)"
+        return 0
+    fi
+
+    local country
+    case "$code" in
+        DE) country="Germany" ;;
+        NL) country="Netherlands" ;;
+        US) country="United States" ;;
+        GB) country="United Kingdom" ;;
+        FR) country="France" ;;
+        SE) country="Sweden" ;;
+        CH) country="Switzerland" ;;
+        *) country="country code $code" ;;
+    esac
+    echo "Selected exit location: $country ($code)"
 }
 
 # ---------- TUI (interactive menu) ----------
@@ -1172,7 +1204,8 @@ cmd_tui_advanced() {
     while true; do
         local choice exitstatus
         if choice=$("$backend" --title "Advanced Settings" \
-            --menu "Preferred exit node country:" 22 68 11 \
+            --menu "Preferred exit node country:" 22 68 12 \
+            "SHOW" "Show selected exit location" \
             "DE" "Germany"                     \
             "NL" "Netherlands"                  \
             "US" "United States"                 \
@@ -1194,6 +1227,9 @@ cmd_tui_advanced() {
         fi
 
         case "$choice" in
+            SHOW)
+                _tui_run_and_show "$backend" "Selected exit location" cmd_exit_node_show || true
+                ;;
             ANY)
                 _tui_run_and_show "$backend" "Clearing exit node preference..." set_torrc_exit_node "" || true
                 ;;
@@ -1299,6 +1335,7 @@ usage() {
     ${C_CYAN}status${C_RESET}      Show current status and exit IP
     ${C_CYAN}check${C_RESET}       Verify traffic is really passing through Tor
     ${C_CYAN}exit-node${C_RESET}   Set preferred exit country (CC) or clear it with 'any'
+    ${C_CYAN}exit-node show${C_RESET} Show the selected exit country
     ${C_CYAN}about${C_RESET}       Show torsystem version
     ${C_CYAN}update${C_RESET}      Check for a newer release (does not install it)
     ${C_CYAN}tui${C_RESET}         Launch an interactive menu (whiptail/dialog)
