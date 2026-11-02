@@ -16,7 +16,7 @@
 #
 set -euo pipefail
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 
 # ---------- Colors & style ----------
 if [[ -t 1 ]]; then
@@ -1014,6 +1014,8 @@ cmd_check() {
 set_torrc_exit_node() {
     local code="${1:-}"
     require_root
+    is_active ||
+        die "Tor routing is stopped. Run 'start' first before changing the exit location."
     require_cmds tor
 
     if [[ -n "$code" && ! "$code" =~ ^[A-Z]{2}$ ]]; then

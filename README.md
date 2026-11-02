@@ -130,6 +130,7 @@ The same setting is also available from the TUI's **Advanced settings** menu. Yo
 - **Any country**: clears the restriction and goes back to the default (any exit relay)
 
 Picking a country updates `torrc` (`ExitNodes {XX}` + `StrictNodes 1`), restarts Tor, and waits for it to re-bootstrap before returning you to the menu. Note: restricting to one country means fewer available relays, so circuits may take a little longer to build.
+Changing or clearing the exit country requires Tor routing to be active; if it is stopped, run `sudo ./torsystem.sh start` first. The `exit-node show` command remains available while stopped.
 
 ## ⚙️ How it works
 
