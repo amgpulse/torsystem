@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-11-02
+
+### Added
+
+- Added `exit-node show` to display the configured exit location in the CLI and
+  TUI Advanced Settings menu.
+
+### Changed
+
+- Require Tor routing to be active before changing or clearing the preferred
+  exit country; displaying the selection remains available while stopped.
+
 ## [1.8.0] - 2026-11-01
 
 ### Added
@@ -131,7 +143,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `iptables`, with `install`, `start`, `stop`, `restart`, `status` and `check`
   commands, multi-distro package detection, and a built-in leak check.
 
-[Unreleased]: https://github.com/amgpulse/torsystem/compare/v1.8.0...HEAD
+[Unreleased]: https://github.com/amgpulse/torsystem/compare/v1.8.1...HEAD
+[1.8.1]: https://github.com/amgpulse/torsystem/compare/v1.8.0...v1.8.1
 [1.8.0]: https://github.com/amgpulse/torsystem/compare/v1.7.1...v1.8.0
 [1.7.1]: https://github.com/amgpulse/torsystem/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/amgpulse/torsystem/compare/v1.6.1...v1.7.0
